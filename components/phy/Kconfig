@@ -1,0 +1,39 @@
+menu "LoRa PHY Configuration"
+
+config LORA_FREQUENCY
+    int "LoRa Frequency (Hz)"
+    default 915000000
+    help
+        RF frequency in Hz. Example: 915000000 for 915 MHz.
+
+config LORA_SPREADING_FACTOR
+    int "Spreading Factor (7-12)"
+    range 7 12
+    default 9
+
+config LORA_BANDWIDTH
+    int "Bandwidth Index"
+    default 7
+    help
+        7 = 125kHz
+        8 = 250kHz
+        9 = 500kHz
+
+config LORA_CODING_RATE
+    int "Coding Rate (1-4)"
+    range 1 4
+    default 1
+
+config LORA_PREAMBLE_LENGTH
+    int "Preamble Length"
+    default 8
+
+config LORA_SYNC_WORD
+    hex "Sync Word"
+    default 0x34
+
+config LORA_ENABLE_CRC
+    bool "Enable CRC"
+    default y
+
+endmenu
