@@ -1,3 +1,9 @@
+/*
+ * LoRa PHY driver for SX127x.
+ * Based on code from: https://github.com/nopnop2002/esp-idf-sx127x
+ * Credit: nopnop2002
+ */
+
 /* ============================================================
  *  Includes
  * ============================================================ */

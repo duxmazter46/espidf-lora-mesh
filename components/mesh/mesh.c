@@ -720,12 +720,16 @@ void mesh_set_node_state(uint16_t node_id, mesh_node_state_t state)
 {
     if (node_id >= MESH_MAX_NODES)
         return;
+    /* Always refresh last_seen on any non-OFFLINE update, even if state
+     * stays the same (e.g. repeated DATA while already RUNNING). */
+    if (state != MESH_NODE_OFFLINE)
+        update_last_seen(node_id);
+
     mesh_node_state_t old = (mesh_node_state_t)node_status_table[node_id].state;
     if (old == state)
         return;
+
     node_status_table[node_id].state = (uint8_t)state;
-    if (state != MESH_NODE_OFFLINE)
-        update_last_seen(node_id);
     if (mesh_node_id == nodecfg_get_root_id()) {
         root_log_node_status(node_id, (root_log_node_state_t)state);
     }
