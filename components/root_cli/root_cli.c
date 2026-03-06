@@ -63,6 +63,25 @@ static uint32_t lcm_u32(uint32_t a, uint32_t b)
 /* Per-cycle: which nodes sent DATA (set by data-at-root callback). */
 static bool received_this_cycle[ROOT_MAX_SLOT_NODES];
 
+/* Per-cycle: last DATA payload from each node (for end-of-cycle CSV log). */
+#define CYCLE_DATA_PAYLOAD_MAX  64
+static uint64_t cycle_data_ts_ms[ROOT_MAX_SLOT_NODES];
+static uint8_t  cycle_data_payload[ROOT_MAX_SLOT_NODES][CYCLE_DATA_PAYLOAD_MAX];
+static uint16_t cycle_data_len[ROOT_MAX_SLOT_NODES];
+
+/* Per-node resync retry count (free-slot healing). Index by node id; reset on DATA or when marking ONLINE. */
+static uint8_t resync_retry_count[ROOT_MAX_SLOT_NODES];
+
+/* Snapshot of node ids in current TDMA schedule (for JOIN callback: reuse TDMA vs remesh). */
+static uint16_t current_schedule_node_ids[ROOT_MAX_SLOT_NODES];
+static uint16_t num_current_schedule = 0;
+
+/* Set when JOIN reports different reporting interval; sync task runs remesh at start of free slot. */
+static volatile bool remesh_pending = false;
+
+/* One-time "all online" notification; reset when commander runs "start" so we can notify again after remesh. */
+static bool all_online_notified = false;
+
 /* Consecutive cycles with no DATA from any child; used to reset LoRa or mesh. */
 static uint8_t s_cycles_no_pkt = 0;
 
@@ -113,6 +132,193 @@ typedef struct {
 } root_sync_task_params_t;
 
 static TaskHandle_t root_sync_task_handle = NULL;
+
+/** Build TDMA payload for a node using current schedule (s_*, tdma_cycle_*). Returns true if node in schedule. */
+static bool root_build_tdma_payload_for_node(uint16_t nid, mesh_tdma_payload_t *out)
+{
+    if (s_base_period_ms == 0 || s_full_cycle_cycles == 0)
+        return false;
+    uint32_t base_period_s = s_base_period_ms / 1000;
+    if (base_period_s == 0)
+        base_period_s = 1;
+    uint32_t interval_s = nodecfg_get_reporting_interval_s(nid);
+    uint16_t report_every = (uint16_t)(interval_s / base_period_s);
+    if (report_every == 0)
+        report_every = 1;
+    uint8_t report_cycle_offset = (uint8_t)(report_every - 1);
+
+    uint8_t slot_index = 0;
+    uint32_t slot_duration_ms = s_base_period_ms;
+    bool found = false;
+    for (uint16_t c = 0; c < s_full_cycle_cycles && c < ROOT_MAX_FULL_CYCLE; c++) {
+        if ((c % report_every) != report_cycle_offset)
+            continue;
+        uint8_t n_slots = tdma_cycle_slot_count[c];
+        slot_duration_ms = (n_slots > 0) ? (s_base_period_ms / n_slots) : s_base_period_ms;
+        for (uint8_t k = 0; k < n_slots - 1 && k < ROOT_MAX_SLOT_NODES; k++) {
+            if (tdma_cycle_nodes[c][k] == nid) {
+                slot_index = k;
+                found = true;
+                break;
+            }
+        }
+        break;
+    }
+    if (!found)
+        return false;
+
+    out->anchor_epoch_ms       = s_anchor_epoch_ms;
+    out->base_period_ms        = s_base_period_ms;
+    out->slot_duration_ms      = slot_duration_ms;
+    out->full_cycle_cycles     = s_full_cycle_cycles;
+    out->report_every_n_cycles = report_every;
+    out->report_cycle_offset   = report_cycle_offset;
+    out->slot_index            = slot_index;
+    out->schedule_hash         = s_tdma_hash;
+    return true;
+}
+
+/* Forward declare so join callback can set remesh_pending; sync task will call it. */
+static void cmd_start(int argc, char **argv);
+static void root_sync_task(void *arg);
+
+/* True if static topology is used and every non-root node in the topology tree is ONLINE. */
+static bool root_all_nodes_in_topo_online(void)
+{
+    if (!nodecfg_has_static_topology())
+        return false;
+    uint16_t topo_size = nodecfg_get_topo_table_size();
+    uint16_t root_id  = nodecfg_get_root_id();
+    for (uint16_t i = 0; i < topo_size; i++) {
+        if (i == root_id)
+            continue;
+        nodecfg_topology_t t;
+        nodecfg_get_topology(i, &t);
+        if (t.parent_id == 0xFFFF && t.child_count == 0)
+            continue;
+        if (!mesh_is_node_online(i))
+            return false;
+    }
+    return true;
+}
+
+static void root_join_cb(uint16_t node_id, uint8_t interval_byte)
+{
+    mesh_set_node_online(node_id, true);
+    if (node_id < ROOT_MAX_SLOT_NODES)
+        resync_retry_count[node_id] = 0;
+
+    /* Notify commander when all nodes in static topology are ONLINE (once per start; reset by "start"). */
+    if (nodecfg_has_static_topology() && !all_online_notified && root_all_nodes_in_topo_online()) {
+        all_online_notified = true;
+        ESP_LOGW(TAG, "COMMANDER: All nodes in topology are ONLINE.");
+    }
+
+    bool in_schedule = false;
+    for (uint16_t i = 0; i < num_current_schedule; i++) {
+        if (current_schedule_node_ids[i] == node_id) {
+            in_schedule = true;
+            break;
+        }
+    }
+    if (in_schedule) {
+        uint32_t config_interval = nodecfg_get_reporting_interval_s(node_id);
+        uint8_t config_byte = (config_interval > 255) ? 255 : (uint8_t)config_interval;
+        if (interval_byte != config_byte) {
+            remesh_pending = true;
+            ESP_LOGI(TAG, "JOIN from node %u: interval changed (%u -> config %lu) -> remesh pending",
+                     (unsigned)node_id, (unsigned)interval_byte, (unsigned long)config_interval);
+        }
+    }
+}
+
+/** Rebuild TDMA from current schedule (reporting intervals may have changed) and restart sync task. Called from sync task when remesh_pending. */
+static void root_do_remesh(void)
+{
+    remesh_pending = false;
+    uint16_t num_online = num_current_schedule;
+    if (num_online == 0)
+        return;
+
+    /* Static to avoid large stack use inside root_sync_task (prevents stack overflow when JOIN triggers remesh). */
+    static uint16_t online_ids[ROOT_MAX_SLOT_NODES];
+    for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++)
+        online_ids[i] = current_schedule_node_ids[i];
+
+    uint64_t epoch_ms = root_get_epoch_ms();
+    uint32_t base_period_s = nodecfg_get_reporting_interval_s(online_ids[0]);
+    for (uint16_t i = 1; i < num_online; i++) {
+        uint32_t iv = nodecfg_get_reporting_interval_s(online_ids[i]);
+        if (iv < base_period_s)
+            base_period_s = iv;
+    }
+    uint32_t full_period_s = nodecfg_get_reporting_interval_s(online_ids[0]);
+    for (uint16_t i = 1; i < num_online; i++) {
+        full_period_s = lcm_u32(full_period_s, nodecfg_get_reporting_interval_s(online_ids[i]));
+    }
+    uint16_t full_cycle_cycles = (uint16_t)(full_period_s / base_period_s);
+    if (full_cycle_cycles == 0)
+        full_cycle_cycles = 1;
+    if (full_cycle_cycles > ROOT_MAX_FULL_CYCLE)
+        full_cycle_cycles = ROOT_MAX_FULL_CYCLE;
+
+    uint32_t base_period_ms = base_period_s * 1000;
+    uint64_t anchor_epoch_ms = ((epoch_ms / (base_period_s * 1000)) + 1) * (uint64_t)base_period_s * 1000;
+    if (base_period_s >= 60)
+        anchor_epoch_ms = ((epoch_ms / 60000) + 1) * 60000;
+
+    tdma_full_cycle_cycles = full_cycle_cycles;
+    for (uint16_t c = 0; c < full_cycle_cycles; c++) {
+        uint8_t idx = 0;
+        for (uint16_t i = 0; i < num_online && idx < ROOT_MAX_SLOT_NODES; i++) {
+            uint16_t nid = online_ids[i];
+            uint32_t interval_s = nodecfg_get_reporting_interval_s(nid);
+            uint16_t report_every = (uint16_t)(interval_s / base_period_s);
+            if (report_every == 0)
+                report_every = 1;
+            uint8_t report_cycle_offset = (uint8_t)(report_every - 1);
+            if ((c % report_every) == report_cycle_offset) {
+                tdma_cycle_nodes[c][idx++] = nid;
+            }
+        }
+        tdma_cycle_slot_count[c] = idx + 1;
+    }
+
+    s_tdma_hash = tdma_compute_hash();
+    s_anchor_epoch_ms   = anchor_epoch_ms;
+    s_base_period_ms    = base_period_ms;
+    s_full_cycle_cycles = full_cycle_cycles;
+
+    for (uint16_t i = 0; i < num_online; i++) {
+        uint16_t nid = online_ids[i];
+        mesh_tdma_payload_t tdma;
+        if (root_build_tdma_payload_for_node(nid, &tdma))
+            mesh_send_to(nid, MESH_PKT_TDMA, (uint8_t *)&tdma, sizeof(tdma));
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    uint32_t sync_every = root_sync_every_cycles(base_period_ms);
+    memset(received_this_cycle, 0, sizeof(received_this_cycle));
+    for (uint16_t i = 0; i < ROOT_MAX_SLOT_NODES; i++)
+        resync_retry_count[i] = 0;
+
+    static root_sync_task_params_t remesh_sync_params;
+    remesh_sync_params.anchor_epoch_ms    = anchor_epoch_ms;
+    remesh_sync_params.base_period_ms     = base_period_ms;
+    remesh_sync_params.sync_every_cycles  = sync_every;
+    remesh_sync_params.num_online         = num_online;
+    remesh_sync_params.full_cycle_cycles  = full_cycle_cycles;
+    for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++)
+        remesh_sync_params.slot_to_node[i] = online_ids[i];
+    for (uint16_t c = 0; c < full_cycle_cycles && c < ROOT_MAX_FULL_CYCLE; c++)
+        remesh_sync_params.slot_count_per_cycle[c] = tdma_cycle_slot_count[c];
+
+    ESP_LOGI(TAG, "Remesh: new TDMA hash 0x%08X, creating new sync task", (unsigned)s_tdma_hash);
+    TaskHandle_t new_handle = NULL;
+    xTaskCreate(root_sync_task, "root_sync", 4096, &remesh_sync_params, 3, &new_handle);
+    root_sync_task_handle = new_handle;
+    vTaskDelete(NULL);
+}
 
 static const char *mesh_node_state_str(mesh_node_state_t s)
 {
@@ -166,6 +372,42 @@ static void root_sync_task(void *arg)
             continue;
         }
 
+        if (remesh_pending) {
+            root_do_remesh();
+            return;
+        }
+
+        /* Re-sync nodes that are ONLINE (no DATA this cycle or hash mismatch): unicast SYNC then TDMA, max 3 attempts. */
+        {
+            uint64_t epoch_ms = root_get_epoch_ms();
+            for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++) {
+                uint16_t nid = p->slot_to_node[i];
+                if (nid >= ROOT_MAX_SLOT_NODES)
+                    continue;
+                if (mesh_get_node_state(nid) != MESH_NODE_ONLINE)
+                    continue;
+                if (resync_retry_count[nid] >= 3)
+                    continue;
+                bool ack = mesh_send_to(nid, MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
+                if (ack) {
+                    mesh_tdma_payload_t tdma;
+                    if (root_build_tdma_payload_for_node(nid, &tdma)) {
+                        mesh_send_to(nid, MESH_PKT_TDMA, (uint8_t *)&tdma, sizeof(tdma));
+                        ESP_LOGI(TAG, "Resync node %u: SYNC+TDMA sent", (unsigned)nid);
+                        ESP_LOGW(TAG, "COMMANDER: Node %u resynced (SYNC+TDMA sent).", (unsigned)nid);
+                    }
+                    resync_retry_count[nid] = 0;
+                } else {
+                    resync_retry_count[nid]++;
+                    ESP_LOGW(TAG, "Resync node %u: no ACK (attempt %u/3)", (unsigned)nid, (unsigned)resync_retry_count[nid]);
+                    if (resync_retry_count[nid] >= 3) {
+                        ESP_LOGW(TAG, "COMMANDER: Node %u resync failed after 3 attempts.", (unsigned)nid);
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(400));
+            }
+        }
+
         if (cycle_index % every == 0) {
             uint64_t epoch_ms = root_get_epoch_ms();
             mesh_send(MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
@@ -189,6 +431,7 @@ static void root_sync_task(void *arg)
                 s_cycles_no_pkt++;
                 ESP_LOGW(TAG, "No packet from any child this cycle (consecutive=%u)", (unsigned)s_cycles_no_pkt);
                 if (s_cycles_no_pkt >= 3) {
+                    ESP_LOGW(TAG, "COMMANDER: No DATA from any node for 3 cycles; root restarting.");
                     ESP_LOGE(TAG, "3 cycles with no packet from any child -> resetting mesh");
                     fflush(stdout);
                     vTaskDelay(pdMS_TO_TICKS(200));
@@ -197,13 +440,73 @@ static void root_sync_task(void *arg)
             }
         }
 
+        /* Notify commander which nodes sent DATA this cycle (before we clear received_this_cycle). */
+        {
+            char data_buf[64];
+            size_t off = 0;
+            for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES && off < sizeof(data_buf) - 8; i++) {
+                uint16_t nid = p->slot_to_node[i];
+                if (nid < ROOT_MAX_SLOT_NODES && received_this_cycle[nid]) {
+                    int n = snprintf(data_buf + off, sizeof(data_buf) - off, "%u ", (unsigned)nid);
+                    if (n > 0 && (size_t)n < sizeof(data_buf) - off)
+                        off += (size_t)n;
+                    else
+                        break;
+                }
+            }
+            if (off > 0) {
+                if (data_buf[off - 1] == ' ')
+                    data_buf[off - 1] = '\0';
+                else
+                    data_buf[off] = '\0';
+                ESP_LOGW(TAG, "COMMANDER: DATA this cycle: %s", data_buf);
+            } else {
+                ESP_LOGW(TAG, "COMMANDER: DATA this cycle: none");
+            }
+        }
+
+        /* CSV lines for DATA received this cycle (no header; commander can parse). */
+        for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++) {
+            uint16_t nid = p->slot_to_node[i];
+            if (nid >= ROOT_MAX_SLOT_NODES || !received_this_cycle[nid])
+                continue;
+            uint64_t ts_s = cycle_data_ts_ms[nid] / 1000;
+            uint16_t plen = cycle_data_len[nid];
+            uint8_t *pb = cycle_data_payload[nid];
+            printf("%u,%llu,", (unsigned)nid, (unsigned long long)ts_s);
+            bool printable = true;
+            bool has_comma = false;
+            for (uint16_t j = 0; j < plen; j++) {
+                if (pb[j] < 32 || pb[j] > 126) printable = false;
+                if (pb[j] == ',') has_comma = true;
+            }
+            if (printable && plen > 0 && !has_comma) {
+                for (uint16_t j = 0; j < plen; j++)
+                    putchar((char)pb[j]);
+            } else if (printable && plen > 0) {
+                putchar('"');
+                for (uint16_t j = 0; j < plen; j++) {
+                    if (pb[j] == '"') printf("\"\"");
+                    else putchar((char)pb[j]);
+                }
+                putchar('"');
+            } else {
+                for (uint16_t j = 0; j < plen && j < CYCLE_DATA_PAYLOAD_MAX; j++)
+                    printf("%02X", pb[j]);
+            }
+            printf("\n");
+        }
+
         /* Update node status (no DATA -> back to ONLINE), report to log and terminal */
         for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++) {
             uint16_t nid = p->slot_to_node[i];
             if (nid >= ROOT_MAX_SLOT_NODES)
                 continue;
-            if (!received_this_cycle[nid])
+            if (!received_this_cycle[nid]) {
                 mesh_set_node_state(nid, MESH_NODE_ONLINE);
+                if (nid < ROOT_MAX_SLOT_NODES)
+                    resync_retry_count[nid] = 0;
+            }
             received_this_cycle[nid] = false;
         }
         /* Cycle start is on .00 boundary; label as yymmdd-hh:mm (24h UTC). */
@@ -222,6 +525,25 @@ static void root_sync_task(void *arg)
             printf("  Node %u: %s\n", (unsigned)nid, mesh_node_state_str(s));
         }
         printf("------------------------\n");
+
+        {
+            char status_buf[128];
+            size_t off = 0;
+            for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES && off < sizeof(status_buf) - 16; i++) {
+                uint16_t nid = p->slot_to_node[i];
+                mesh_node_state_t s = mesh_get_node_state(nid);
+                int n = snprintf(status_buf + off, sizeof(status_buf) - off, "n%u=%s ", (unsigned)nid, mesh_node_state_str(s));
+                if (n > 0 && (size_t)n < sizeof(status_buf) - off)
+                    off += (size_t)n;
+                else
+                    break;
+            }
+            if (off > 0 && status_buf[off - 1] == ' ')
+                status_buf[off - 1] = '\0';
+            else
+                status_buf[off] = '\0';
+            ESP_LOGW(TAG, "COMMANDER: CYCLE_STATUS cycle=%lu %s", (unsigned long)cycle_index, status_buf);
+        }
 
         cycle_index++;
         bool printed_1s = false;
@@ -317,14 +639,38 @@ static void root_data_csv_dump(void)
         printf("(file: %s, %u rows)\n", s_csv_filename, (unsigned)s_csv_count);
 }
 
+/* Max payload bytes to include in DATA_RX log (hex string = 2* this). */
+#define DATA_RX_LOG_PAYLOAD_MAX  64
+
 static void root_data_at_root_cb(uint16_t node_id, const uint8_t *payload, uint16_t len, int rssi, float snr)
 {
-    (void)rssi;
-    (void)snr;
-    if (node_id < ROOT_MAX_SLOT_NODES)
+    /* Notify commander if root has no TDMA (e.g. after restart): nodes are running but root cannot schedule. */
+    if (s_base_period_ms == 0 || s_full_cycle_cycles == 0) {
+        static bool no_tdma_warned = false;
+        if (!no_tdma_warned) {
+            no_tdma_warned = true;
+            ESP_LOGW(TAG, "COMMANDER: Node %u sent DATA but root has no TDMA schedule (cached TDMA lost). Run 'start' to remesh.", (unsigned)node_id);
+        }
+    }
+
+    if (node_id < ROOT_MAX_SLOT_NODES) {
         received_this_cycle[node_id] = true;
+        resync_retry_count[node_id] = 0;
+    }
 
     uint64_t ts_ms = root_get_epoch_ms();
+
+    /* Log each DATA RX so pi service or user can grep/save (COMMANDER: DATA_RX ...). */
+    {
+        char hex_buf[2 * DATA_RX_LOG_PAYLOAD_MAX + 1];
+        uint16_t plen = len > DATA_RX_LOG_PAYLOAD_MAX ? DATA_RX_LOG_PAYLOAD_MAX : len;
+        hex_buf[0] = '\0';
+        for (uint16_t i = 0; i < plen; i++)
+            snprintf(hex_buf + 2 * i, (size_t)3, "%02X", payload[i]);
+        hex_buf[2 * plen] = '\0';
+        ESP_LOGI(TAG, "COMMANDER: DATA_RX node=%u ts=%llu len=%u rssi=%d snr=%.2f hex=%s",
+                 (unsigned)node_id, (unsigned long long)ts_ms, (unsigned)len, rssi, snr, hex_buf);
+    }
 
     /* If payload carries TDMA hash prefix, verify it and strip it before CSV logging. */
     if (len >= sizeof(uint32_t)) {
@@ -341,9 +687,19 @@ static void root_data_at_root_cb(uint16_t node_id, const uint8_t *payload, uint1
 
         const uint8_t *app_payload = payload + sizeof(uint32_t);
         uint16_t app_len = (uint16_t)(len - (uint16_t)sizeof(uint32_t));
+        if (node_id < ROOT_MAX_SLOT_NODES) {
+            cycle_data_ts_ms[node_id] = ts_ms;
+            cycle_data_len[node_id] = app_len < CYCLE_DATA_PAYLOAD_MAX ? app_len : (uint16_t)CYCLE_DATA_PAYLOAD_MAX;
+            memcpy(cycle_data_payload[node_id], app_payload, (size_t)cycle_data_len[node_id]);
+        }
         root_data_csv_append(node_id, ts_ms, app_payload, app_len);
     } else {
         /* Legacy/short payload without hash. */
+        if (node_id < ROOT_MAX_SLOT_NODES) {
+            cycle_data_ts_ms[node_id] = ts_ms;
+            cycle_data_len[node_id] = len < CYCLE_DATA_PAYLOAD_MAX ? len : (uint16_t)CYCLE_DATA_PAYLOAD_MAX;
+            memcpy(cycle_data_payload[node_id], payload, (size_t)cycle_data_len[node_id]);
+        }
         root_data_csv_append(node_id, ts_ms, payload, len);
     }
 }
@@ -450,17 +806,23 @@ uint64_t root_get_epoch_ms(void)
     return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 }
 
+/* Print epoch_ms (Unix UTC) in local time using s_tz_offset_s. UTC+7 => add 7h to get display time. */
 static void print_human_time(uint64_t epoch_ms)
 {
-    time_t seconds = epoch_ms / 1000;
+    time_t utc_s = (time_t)(epoch_ms / 1000);
+    time_t display_s = utc_s + (time_t)s_tz_offset_s;
 
     struct tm tm_info;
-    gmtime_r(&seconds, &tm_info);  // Always print in UTC
+    gmtime_r(&display_s, &tm_info);
 
     char buffer[64];
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_info);
 
-    printf("%s.%03llu UTC\n", buffer, epoch_ms % 1000);
+    int32_t h = s_tz_offset_s / 3600;
+    if (h >= 0)
+        printf("%s.%03llu UTC+%ld\n", buffer, epoch_ms % 1000, (long)h);
+    else
+        printf("%s.%03llu UTC%ld\n", buffer, epoch_ms % 1000, (long)h);
 }
 
 
@@ -566,13 +928,18 @@ static void cmd_tdma(int argc, char **argv)
 
     printf("Cycle within period : %u / %u\n",
            (unsigned)cycle_mod,
-           (unsigned)(s_full_cycle_cycles - 1));
+           (unsigned)s_full_cycle_cycles);
 
     int64_t sec_to_next = (int64_t)(next_cycle_ms - now_ms) / 1000;
     if (sec_to_next < 0)
         sec_to_next = 0;
 
     printf("Next cycle in       : %lld s\n", (long long)sec_to_next);
+
+    uint32_t sync_every = root_sync_every_cycles(s_base_period_ms);
+    printf("Periodic SYNC every : %lu cycles (drift bound %u ms)\n",
+           (unsigned long)sync_every, (unsigned)DRIFT_BOUND_MS);
+    printf("Resync (healing)    : in free slot, up to 3 attempts per ONLINE node per cycle\n");
 
     printf("\n");
 
@@ -660,8 +1027,8 @@ static void cmd_cycle(int argc, char **argv)
            (unsigned long long)cycle_index);
 
     printf("Cycle in pattern  : %u / %u\n",
-           cycle_mod,
-           (unsigned)(s_full_cycle_cycles - 1));
+           (unsigned)cycle_mod,
+           (unsigned)s_full_cycle_cycles);
 
     printf("Cycle length      : %lu s\n",
            (unsigned long)(s_base_period_ms / 1000));
@@ -723,6 +1090,7 @@ static void cmd_ping(int argc, char **argv)
     bool ok = ping(target);
 
     printf("Ping result: %s\n", ok ? "OK" : "FAIL");
+    mesh_start_rx_continuous();  /* return root to RX so it can receive again */
 }
 
 static void cmd_start(int argc, char **argv)
@@ -874,44 +1242,19 @@ static void cmd_start(int argc, char **argv)
     printf("TDMA schedule hash: 0x%08X\n", (unsigned)s_tdma_hash);
 
     /* Send per-node TDMA payload (slot_index and slot_duration_ms for the cycle(s) where node reports). */
+    s_anchor_epoch_ms   = anchor_epoch_ms;
+    s_base_period_ms    = base_period_ms;
+    s_full_cycle_cycles = full_cycle_cycles;
     for (uint16_t i = 0; i < num_online; i++) {
         uint16_t nid = online_ids[i];
-        uint32_t interval_s = nodecfg_get_reporting_interval_s(nid);
-        uint16_t report_every = (uint16_t)(interval_s / base_period_s);
-        if (report_every == 0)
-            report_every = 1;
-        uint8_t report_cycle_offset = (uint8_t)(report_every - 1);
-
-        /* Find a cycle where this node reports and get its slot index and slot_duration. */
-        uint8_t slot_index = 0;
-        uint32_t slot_duration_ms = base_period_ms;
-        for (uint16_t c = 0; c < full_cycle_cycles; c++) {
-            if ((c % report_every) != report_cycle_offset)
-                continue;
-            uint8_t n_slots = tdma_cycle_slot_count[c];
-            slot_duration_ms = base_period_ms / n_slots;
-            for (uint8_t k = 0; k < n_slots - 1; k++) {
-                if (tdma_cycle_nodes[c][k] == nid) {
-                    slot_index = k;
-                    break;
-                }
-            }
-            break;
+        mesh_tdma_payload_t tdma;
+        if (!root_build_tdma_payload_for_node(nid, &tdma)) {
+            printf("  -> Node %u: not in schedule, skip\n", (unsigned)nid);
+            continue;
         }
-
-        mesh_tdma_payload_t tdma = {
-            .anchor_epoch_ms       = anchor_epoch_ms,
-            .base_period_ms        = base_period_ms,
-            .slot_duration_ms      = slot_duration_ms,
-            .full_cycle_cycles     = full_cycle_cycles,
-            .report_every_n_cycles = report_every,
-            .report_cycle_offset   = report_cycle_offset,
-            .slot_index            = slot_index,
-            .schedule_hash         = s_tdma_hash,
-        };
         printf("  -> Node %u: report_every=%u, offset=%u, slot=%u, slot_ms=%lu\n",
-               nid, (unsigned)report_every, (unsigned)report_cycle_offset,
-               (unsigned)slot_index, (unsigned long)slot_duration_ms);
+               nid, (unsigned)tdma.report_every_n_cycles, (unsigned)tdma.report_cycle_offset,
+               (unsigned)tdma.slot_index, (unsigned long)tdma.slot_duration_ms);
         mesh_send_to(nid, MESH_PKT_TDMA, (uint8_t *)&tdma, sizeof(tdma));
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -938,14 +1281,19 @@ static void cmd_start(int argc, char **argv)
     for (uint16_t c = 0; c < full_cycle_cycles && c < ROOT_MAX_FULL_CYCLE; c++)
         sync_params.slot_count_per_cycle[c] = tdma_cycle_slot_count[c];
 
-    s_anchor_epoch_ms   = anchor_epoch_ms;
-    s_base_period_ms    = base_period_ms;
-    s_full_cycle_cycles = full_cycle_cycles;
+    num_current_schedule = num_online;
+    for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++)
+        current_schedule_node_ids[i] = online_ids[i];
+    for (uint16_t i = 0; i < ROOT_MAX_SLOT_NODES; i++)
+        resync_retry_count[i] = 0;
+
+    all_online_notified = false;  /* Allow "all nodes ONLINE" notification again after this start/remesh. */
 
     root_data_csv_start(anchor_epoch_ms);
     mesh_register_data_at_root_cb(root_data_at_root_cb);
+    mesh_register_join_callback(root_join_cb);
 
-    xTaskCreate(root_sync_task, "root_sync", 3072, &sync_params, 3, &root_sync_task_handle);
+    xTaskCreate(root_sync_task, "root_sync", 4096, &sync_params, 3, &root_sync_task_handle);
 }
 
 static void cmd_restart(int argc, char **argv)

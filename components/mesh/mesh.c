@@ -19,7 +19,7 @@
    ========================= */
 
 typedef enum {
-    MESH_NONROOT_STATE_WAIT_FOR_SYNC,       /* Non-root with static topology: wait for SYNC/TDMA from root; LoRa reset every 20s, restart ESP after 2 resets */
+    MESH_NONROOT_STATE_WAIT_FOR_SYNC,       /* Non-root with static topology: wait for SYNC/TDMA from root; LoRa reset every 60s, restart ESP after 2 resets */
     MESH_NONROOT_STATE_WAIT_FOR_ASSIGN,     /* Non-root without static topology: wait for ASSIGN from root; LoRa reset every 20s, never restart ESP */
     MESH_NONROOT_STATE_WAIT_FOR_TDMA,       /* Non-root (after topo received): wait for TDMA from root; LoRa reset every 20s, never restart ESP */
     MESH_NONROOT_STATE_RUNNING,             /* Got ASSIGN or SYNC; normal operation */
@@ -34,7 +34,8 @@ static volatile mesh_nonroot_state_t mesh_nonroot_state = MESH_NONROOT_STATE_WAI
 static nodecfg_topology_t my_topology;
 
 static uint16_t mesh_node_id = 0;
-/* Count consecutive TDMA slots where this node failed to TX successfully. */
+/* Consecutive slots with no ACK from anyone (root/parent) → restart to prevent deadlock. */
+#define MESH_CONSECUTIVE_FAILED_SLOTS_BEFORE_RESTART  3
 static uint8_t mesh_failed_slots = 0;
 static volatile bool mesh_assigned = false;
 static volatile bool mesh_sync_received = false;
@@ -102,6 +103,9 @@ static void mesh_net_rx_handler(mac_rx_event_t *rx);
 
 static mesh_data_at_root_cb_t s_data_at_root_cb = NULL;
 
+typedef void (*mesh_join_cb_t)(uint16_t node_id, uint8_t interval_byte);
+static mesh_join_cb_t s_join_cb = NULL;
+
 /* =========================
    Internal Functions
    ========================= */
@@ -109,31 +113,19 @@ static mesh_data_at_root_cb_t s_data_at_root_cb = NULL;
    {
        if (mesh_node_id == final_dst)
            return final_dst;
-   
-       if (mesh_node_id == nodecfg_get_root_id())
-           return final_dst;  // root sending down
-   
-       return my_topology.parent_id;      // upward tree routing
+
+       if (mesh_node_id == nodecfg_get_root_id()) {
+           /* Multi-hop down: first hop toward target (direct child on path). */
+           uint16_t first = nodecfg_get_first_hop_toward(mesh_node_id, final_dst);
+           if (first != 0xFFFF)
+               return first;
+           return final_dst;  /* fallback: direct (single-hop) */
+       }
+
+       return my_topology.parent_id;      /* upward tree routing */
    }
 
-   static void mesh_tx_task(void *arg)
-   {
-       mesh_tx_job_t job;
-   
-       while (1) {
-   
-           if (xQueueReceive(mesh_tx_queue, &job, portMAX_DELAY)) {
-   
-               ESP_LOGI(TAG, "Forward scheduled, waiting 3s");
-   
-               vTaskDelay(pdMS_TO_TICKS(2000));
-   
-               ESP_LOGI(TAG, "Forwarding now → %u", job.next_hop);
-   
-               mac_send(job.next_hop, job.buffer, job.len);
-           }
-       }
-   }
+   /* Forward TX is done in mesh_running_task during our TDMA slot (no separate task). */
 
    static void mesh_tx_result_handler(mac_event_type_t type)
 {
@@ -158,20 +150,27 @@ static const char *mesh_nonroot_state_str(mesh_nonroot_state_t s)
     }
 }
 
+#define MESH_JOIN_PAYLOAD_MAX 8
 static void mesh_wait_sync_task(void *arg)
 {
     mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_SYNC;
     ESP_LOGI(TAG, "State → %s (broadcasting JOIN once, then listening for SYNC)",
              mesh_nonroot_state_str(mesh_nonroot_state));
 
+    uint8_t join_payload[MESH_JOIN_PAYLOAD_MAX];
     uint16_t id_payload = mesh_node_id;
+    memcpy(join_payload, &id_payload, sizeof(id_payload));
+    uint32_t reporting_interval_s = nodecfg_get_reporting_interval_s(mesh_node_id);
+    join_payload[sizeof(id_payload)] = (reporting_interval_s > 255) ? 255 : (uint8_t)reporting_interval_s;
+    uint16_t join_len = sizeof(id_payload) + 1;
+
     ESP_LOGI(TAG, "[%s] Broadcasting JOIN (node %u)",
              mesh_nonroot_state_str(mesh_nonroot_state), mesh_node_id);
-    mesh_send(MESH_PKT_JOIN, (uint8_t *)&id_payload, sizeof(id_payload));
+    mesh_send(MESH_PKT_JOIN, join_payload, join_len);
 
     phy_start_rx_continuous();
 
-    const TickType_t sync_timeout_ms = 20000;
+    const TickType_t sync_timeout_ms = 60000;  /* wait 60 s before resetting LoRa / restart */
     const TickType_t loop_delay_ms   = 500;
     int lora_reset_count = 0;
     TickType_t last_reset_ticks = xTaskGetTickCount();
@@ -367,6 +366,17 @@ static void mesh_running_task(void *arg)
             continue;
         }
 
+        /* Drain forwarded packets first (multi-hop up): send in our slot to avoid collisions. */
+        const int max_forwards_per_slot = 2;
+        for (int i = 0; i < max_forwards_per_slot && mesh_tx_queue != NULL; i++) {
+            mesh_tx_job_t job;
+            if (xQueueReceive(mesh_tx_queue, &job, 0) != pdPASS)
+                break;
+            ESP_LOGI(TAG, "Forwarding in slot → %u (%u bytes)", (unsigned)job.next_hop, (unsigned)job.len);
+            mac_send(job.next_hop, job.buffer, job.len);
+            vTaskDelay(pdMS_TO_TICKS(400));  /* allow TX + ACK to complete */
+        }
+
         /* Within our slot: keep trying until success or slot end minus guard time. */
         const uint32_t guard_ms = 500;  /* leave ~500 ms before slot end */
         uint64_t slot_end_guard_ms = slot_start_ms + (slot_ms > guard_ms ? (slot_ms - guard_ms) : slot_ms);
@@ -413,24 +423,25 @@ static void mesh_running_task(void *arg)
             }
 
             ESP_LOGW(TAG, "Slot TX failed (no ACK), retrying if time permits");
-            /* Short backoff before retrying inside the same slot. */
-            vTaskDelay(pdMS_TO_TICKS(50));
+            /* 500 ms guard before next send attempt (we already retry up to 2 times). */
+            vTaskDelay(pdMS_TO_TICKS(500));
         }
 
         if (!slot_success) {
-            /* Entire slot failed: reset only the LoRa chip. */
-            ESP_LOGE(TAG, "Slot failed (cycle_index=%llu) → resetting LoRa chip", (unsigned long long)cycle_index);
-            reset_lora();
+            /* Entire slot failed (no ACK from root/parent); stay in RX continuous so root can ping/resync. */
+            ESP_LOGE(TAG, "Slot failed (cycle_index=%llu)", (unsigned long long)cycle_index);
+            phy_start_rx_continuous();
             if (mesh_failed_slots < 0xFF)
                 mesh_failed_slots++;
-            if (mesh_failed_slots >= 3) {
-                ESP_LOGE(TAG, "Three consecutive failed TDMA slots → restarting node");
+            if (mesh_failed_slots >= MESH_CONSECUTIVE_FAILED_SLOTS_BEFORE_RESTART) {
+                ESP_LOGE(TAG, "%u consecutive slots with no ACK → restarting node (prevent deadlock)",
+                        (unsigned)MESH_CONSECUTIVE_FAILED_SLOTS_BEFORE_RESTART);
                 fflush(stdout);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_restart();
             }
         } else {
-            /* Successful slot → clear consecutive failed-slot counter. */
+            /* Got ACK → clear consecutive failed-slot counter. */
             mesh_failed_slots = 0;
         }
 
@@ -464,7 +475,6 @@ void mesh_start_runtime(void)
     net_register_event_callback(mesh_tx_result_handler);
 
     mesh_tx_queue = xQueueCreate(5, sizeof(mesh_tx_job_t));
-    xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 
     net_register_forward_callback(mesh_forward_handler);
     net_register_rx_callback(mesh_net_rx_handler);
@@ -533,16 +543,27 @@ static void mesh_handle_sync_clock(uint8_t *payload, uint16_t len)
 }
 
 static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
-                                uint16_t mesh_len, mac_rx_event_t *rx)
+                                uint16_t mesh_len, mac_rx_event_t *rx,
+                                const net_header_t *net_hdr)
 {
+    /* For unicast, net_hdr is set; use net_hdr->src as original source for multi-hop DATA. */
+    uint16_t data_src = (net_hdr != NULL) ? net_hdr->src : rx->src;
+
     switch (mhdr->type) {
         case MESH_PKT_JOIN:
             if (mesh_node_id == nodecfg_get_root_id()) {
                 uint16_t joining_id = 0;
+                uint8_t interval_byte = 0;
                 if (mesh_len >= sizeof(uint16_t))
                     memcpy(&joining_id, mesh_payload, sizeof(joining_id));
-                mesh_set_node_online(joining_id, true);
-                ESP_LOGI(TAG, "JOIN from node %u -> marked ONLINE", joining_id);
+                if (mesh_len >= 3)
+                    interval_byte = mesh_payload[2];
+                if (s_join_cb) {
+                    s_join_cb(joining_id, interval_byte);
+                } else {
+                    mesh_set_node_online(joining_id, true);
+                }
+                ESP_LOGI(TAG, "JOIN from node %u (interval_byte=%u) -> marked ONLINE", joining_id, (unsigned)interval_byte);
             }
             break;
 
@@ -607,10 +628,10 @@ static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
 
         case MESH_PKT_DATA:
             if (mesh_node_id == nodecfg_get_root_id()) {
-                mesh_set_node_state(rx->src, MESH_NODE_RUNNING);
-                root_log_data_rx(rx->src, mesh_len, rx->rssi, rx->snr);
+                mesh_set_node_state(data_src, MESH_NODE_RUNNING);
+                root_log_data_rx(data_src, mesh_len, rx->rssi, rx->snr);
                 if (s_data_at_root_cb)
-                    s_data_at_root_cb(rx->src, mesh_payload, mesh_len, rx->rssi, rx->snr);
+                    s_data_at_root_cb(data_src, mesh_payload, mesh_len, rx->rssi, rx->snr);
             }
             if (mesh_len > 0)
                 ESP_LOGI(TAG, "DATA from node (see payload below)");
@@ -625,26 +646,6 @@ static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
         "MESH RX: src_mac=%u type=%u len=%u RSSI=%d SNR=%.2f",
         rx->src, mhdr->type, mesh_len, rx->rssi, rx->snr);
 
-    if (mesh_len > 0) {
-        bool printable = true;
-        for (int i = 0; i < mesh_len; i++) {
-            if (mesh_payload[i] < 32 || mesh_payload[i] > 126) {
-                printable = false;
-                break;
-            }
-        }
-        if (printable) {
-            printf("RX Payload (ascii): ");
-            for (int i = 0; i < mesh_len; i++)
-                printf("%c", mesh_payload[i]);
-            printf("\n");
-        } else {
-            printf("RX Payload (hex): ");
-            for (int i = 0; i < mesh_len; i++)
-                printf("%02X ", mesh_payload[i]);
-            printf("\n");
-        }
-    }
 }
 
 static void mesh_net_rx_handler(mac_rx_event_t *rx)
@@ -665,7 +666,7 @@ static void mesh_net_rx_handler(mac_rx_event_t *rx)
         uint8_t *mesh_payload  = rx->payload + sizeof(mesh_header_t);
         uint16_t mesh_len      = rx->payload_len - sizeof(mesh_header_t);
 
-        mesh_process_packet(mhdr, mesh_payload, mesh_len, rx);
+        mesh_process_packet(mhdr, mesh_payload, mesh_len, rx, NULL);
         return;
     }
 
@@ -675,14 +676,15 @@ static void mesh_net_rx_handler(mac_rx_event_t *rx)
     if (rx->payload_len < sizeof(net_header_t) + sizeof(mesh_header_t))
         return;
 
-    uint8_t *mesh_ptr       = rx->payload + sizeof(net_header_t);
+    net_header_t *net_hdr  = (net_header_t *)rx->payload;
+    uint8_t *mesh_ptr      = rx->payload + sizeof(net_header_t);
     uint16_t mesh_total_len = rx->payload_len - sizeof(net_header_t);
 
     mesh_header_t *mhdr    = (mesh_header_t *)mesh_ptr;
     uint8_t *mesh_payload  = mesh_ptr + sizeof(mesh_header_t);
     uint16_t mesh_len      = mesh_total_len - sizeof(mesh_header_t);
 
-    mesh_process_packet(mhdr, mesh_payload, mesh_len, rx);
+    mesh_process_packet(mhdr, mesh_payload, mesh_len, rx, net_hdr);
 }
 
 uint16_t mesh_get_root_id(void){
@@ -764,6 +766,11 @@ void mesh_register_data_at_root_cb(mesh_data_at_root_cb_t cb)
     s_data_at_root_cb = cb;
 }
 
+void mesh_register_join_callback(void (*cb)(uint16_t node_id, uint8_t interval_byte))
+{
+    s_join_cb = (mesh_join_cb_t)cb;
+}
+
 bool ping(uint16_t target)
 {
     uint8_t msg[] = "PING";
@@ -783,9 +790,15 @@ void reset_lora(void)
     ESP_LOGI(TAG, "Resetting LoRa chip...");
     vTaskDelay(pdMS_TO_TICKS(200));
     /* phy_init() must only be called once at startup because it owns
-     * SPI bus initialization. For a runtime \"reset\" from the CLI,
-     * just reset the radio chip and return it to RX. */
+     * SPI bus initialization. For a runtime "reset", just reset the
+     * radio chip. Always leave in RX continuous so (non-root) can
+     * be pinged by root and marked ONLINE. */
     phy_reset();
+    phy_start_rx_continuous();
+}
+
+void mesh_start_rx_continuous(void)
+{
     phy_start_rx_continuous();
 }
 
@@ -812,29 +825,35 @@ static void mesh_forward_handler(
         }
     }
 
-    if (!from_child) {
-        ESP_LOGW(TAG, "Drop: not from my child (last_hop=%u src=%u)",
-                last_hop, hdr->src);
+    bool from_parent = (last_hop == my_topology.parent_id);
+
+    uint16_t next_hop = 0xFFFF;
+    if (from_child) {
+        next_hop = my_topology.parent_id;
+        if (next_hop == 0xFFFF)
+            return;
+    } else if (from_parent) {
+        /* Downward: forward to child on path to final destination. */
+        next_hop = nodecfg_get_first_hop_toward(mesh_node_id, hdr->dst);
+        if (next_hop == 0xFFFF) {
+            ESP_LOGW(TAG, "Drop: dst %u not in my subtree (last_hop=%u)", (unsigned)hdr->dst, (unsigned)last_hop);
+            return;
+        }
+    } else {
+        ESP_LOGW(TAG, "Drop: not from my child or parent (last_hop=%u src=%u)",
+                (unsigned)last_hop, (unsigned)hdr->src);
         return;
     }
 
     hdr->ttl--;
 
-    uint16_t next_hop = my_topology.parent_id;
-    if (my_topology.parent_id == 0xFFFF)
-        return;
-
-
     uint8_t buffer[256];
-
     memcpy(buffer, hdr, sizeof(net_header_t));
     memcpy(buffer + sizeof(net_header_t), payload, len);
 
     mesh_tx_job_t job;
-
     job.next_hop = next_hop;
     job.len = sizeof(net_header_t) + len;
-
     memcpy(job.buffer, buffer, job.len);
 
     if (xQueueSend(mesh_tx_queue, &job, 0) != pdPASS) {

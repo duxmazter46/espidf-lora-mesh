@@ -72,6 +72,17 @@ static const uint32_t node_reporting_interval_s[] = {
     [2] = 60,  /* 1 minute (use 600 for 10-min: cycles 1-9 = 2 slots, cycle 10 = 3 slots) */
 };
 
+/* Power policy: default for all nodes. Manual edit per node in node_power_policy[] below if needed.
+ * FULL = no sleep, idle when not in slot. BATTERY_SAVER = light sleep, wake on free slot.
+ * VERY_BATTERY_SAVER = deep sleep, wake on free slot. MINIMAL_WAKE = deep sleep, wake only on root resync. */
+#define NODECFG_POWER_POLICY_DEFAULT  NODECFG_POWER_FULL
+
+static const uint8_t node_power_policy[] = {
+    [0] = NODECFG_POWER_FULL,  /* root (unused) */
+    [1] = NODECFG_POWER_POLICY_DEFAULT,
+    [2] = NODECFG_POWER_POLICY_DEFAULT,
+};
+
 uint16_t nodecfg_get_node_id(void)
 {
     uint8_t mac[6];
@@ -125,6 +136,40 @@ void nodecfg_get_topology(uint16_t node_id,
     *topo = topo_table[node_id];
 }
 
+static bool target_in_subtree(uint16_t node_id, uint16_t target, uint16_t table_size)
+{
+    if (node_id >= table_size || node_id == 0xFFFF)
+        return false;
+    if (node_id == target)
+        return true;
+    nodecfg_topology_t topo;
+    topo = topo_table[node_id];
+    for (uint8_t i = 0; i < topo.child_count; i++) {
+        if (target_in_subtree(topo.children[i], target, table_size))
+            return true;
+    }
+    return false;
+}
+
+uint16_t nodecfg_get_first_hop_toward(uint16_t from_node, uint16_t target)
+{
+    uint16_t table_size = (uint16_t)(sizeof(topo_table) / sizeof(topo_table[0]));
+    if (from_node >= table_size || target >= table_size)
+        return 0xFFFF;
+    if (from_node == target)
+        return target;
+    nodecfg_topology_t topo;
+    topo = topo_table[from_node];
+    for (uint8_t i = 0; i < topo.child_count; i++) {
+        uint16_t c = topo.children[i];
+        if (c == target)
+            return c;
+        if (target_in_subtree(c, target, table_size))
+            return c;
+    }
+    return 0xFFFF;
+}
+
 uint32_t nodecfg_get_reporting_interval_s(uint16_t node_id)
 {
     uint16_t table_size =
@@ -136,6 +181,15 @@ uint32_t nodecfg_get_reporting_interval_s(uint16_t node_id)
             return v;
     }
     return (uint32_t)REPORTING_INTERVAL_S;
+}
+
+uint8_t nodecfg_get_power_policy(uint16_t node_id)
+{
+    uint16_t table_size =
+        sizeof(node_power_policy) / sizeof(node_power_policy[0]);
+    if (node_id < table_size)
+        return node_power_policy[node_id];
+    return (uint8_t)NODECFG_POWER_POLICY_DEFAULT;
 }
 
 uint16_t nodecfg_get_topo_table_size(void)

@@ -184,27 +184,35 @@ static void mac_send_frame(mac_header_t *hdr, uint8_t *payload, uint16_t len)
     if (payload && len > 0) {
 
         bool printable = true;
-
+    
         for (int i = 0; i < len; i++) {
             if (payload[i] < 32 || payload[i] > 126) {
                 printable = false;
                 break;
             }
         }
-
+    
         if (printable) {
-            printf("TX Payload (ascii): ");
-            for (int i = 0; i < len; i++) {
-                printf("%c", payload[i]);
+    
+            char asciibuf[256];
+            memcpy(asciibuf, payload, len);
+            asciibuf[len] = '\0';
+    
+            ESP_LOGI(TAG, "TX Payload (ascii): %s", asciibuf);
+    
+        } else {
+    
+            char hexbuf[512];
+            int offset = 0;
+    
+            for (int i = 0; i < len && offset < sizeof(hexbuf) - 4; i++) {
+                offset += snprintf(hexbuf + offset,
+                                   sizeof(hexbuf) - offset,
+                                   "%02X ",
+                                   payload[i]);
             }
-            printf("\n");
-        }
-        else {
-            printf("TX Payload (hex): ");
-            for (int i = 0; i < len; i++) {
-                printf("%02X ", payload[i]);
-            }
-            printf("\n");
+    
+            ESP_LOGI(TAG, "TX Payload (hex): %s", hexbuf);
         }
     }
 
@@ -441,6 +449,35 @@ void mac_phy_event_handler(phy_event_type_t event)
             rx_event.rssi = rssi;
             rx_event.snr = snr;
 
+            /* RX Payload debug print (same style as TX) */
+            {
+                uint16_t plen = rx_event.payload_len;
+                uint8_t *p = rx_event.payload;
+                if (p && plen > 0) {
+                    bool printable = true;
+                    for (uint16_t i = 0; i < plen; i++) {
+                        if (p[i] < 32 || p[i] > 126) {
+                            printable = false;
+                            break;
+                        }
+                    }
+                    if (printable) {
+                        char asciibuf[256];
+                        uint16_t copy = plen < sizeof(asciibuf) - 1 ? plen : (uint16_t)(sizeof(asciibuf) - 1);
+                        memcpy(asciibuf, p, copy);
+                        asciibuf[copy] = '\0';
+                        ESP_LOGI(TAG, "RX Payload (ascii): %s", asciibuf);
+                    } else {
+                        char hexbuf[512];
+                        int offset = 0;
+                        for (uint16_t i = 0; i < plen && offset < (int)(sizeof(hexbuf) - 4); i++) {
+                            offset += snprintf(hexbuf + offset, sizeof(hexbuf) - (size_t)offset, "%02X ", p[i]);
+                        }
+                        ESP_LOGI(TAG, "RX Payload (hex): %s", hexbuf);
+                    }
+                }
+            }
+
             if (mac_event_callback)
                 mac_event_callback(MAC_EVENT_RX, &rx_event);
 
@@ -469,6 +506,35 @@ void mac_phy_event_handler(phy_event_type_t event)
             rx_event.payload_len = len - sizeof(mac_header_t);
             rx_event.rssi = rssi;
             rx_event.snr  = snr;
+
+            /* RX Payload debug print (same style as TX) */
+            {
+                uint16_t plen = rx_event.payload_len;
+                uint8_t *p = rx_event.payload;
+                if (p && plen > 0) {
+                    bool printable = true;
+                    for (uint16_t i = 0; i < plen; i++) {
+                        if (p[i] < 32 || p[i] > 126) {
+                            printable = false;
+                            break;
+                        }
+                    }
+                    if (printable) {
+                        char asciibuf[256];
+                        uint16_t copy = plen < sizeof(asciibuf) - 1 ? plen : (uint16_t)(sizeof(asciibuf) - 1);
+                        memcpy(asciibuf, p, copy);
+                        asciibuf[copy] = '\0';
+                        ESP_LOGI(TAG, "RX Payload (ascii): %s", asciibuf);
+                    } else {
+                        char hexbuf[512];
+                        int offset = 0;
+                        for (uint16_t i = 0; i < plen && offset < (int)(sizeof(hexbuf) - 4); i++) {
+                            offset += snprintf(hexbuf + offset, sizeof(hexbuf) - (size_t)offset, "%02X ", p[i]);
+                        }
+                        ESP_LOGI(TAG, "RX Payload (hex): %s", hexbuf);
+                    }
+                }
+            }
 
             if (mac_event_callback)
                 mac_event_callback(MAC_EVENT_RX, &rx_event);

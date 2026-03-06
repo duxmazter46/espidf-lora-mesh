@@ -247,15 +247,18 @@ phy_read_reg_buffer(int reg, uint8_t *val, int len)
 }
 
 /**
- * Perform physical reset on the Lora chip
+ * Perform physical reset on the Lora chip.
+ * Invalidate driver _state so next phy_start_rx_continuous() actually programs
+ * the chip and leaves it in RX (otherwise we skip the transition and stay wrong).
  */
-void 
+void
 phy_reset(void)
 {
    gpio_set_level(CONFIG_RST_GPIO, 0);
    vTaskDelay(pdMS_TO_TICKS(1));
    gpio_set_level(CONFIG_RST_GPIO, 1);
    vTaskDelay(pdMS_TO_TICKS(10));
+   _state = LORA_STATE_STANDBY;  /* chip is in standby after hw reset; force next mode set to run */
 }
 
 /**

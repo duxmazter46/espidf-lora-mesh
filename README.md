@@ -4,8 +4,7 @@ ESP32 LoRa mesh with TDMA scheduling.
 
 **Credits:** The LoRa PHY driver (`components/phy/phy.c`) is based on code from [nopnop2002/esp-idf-sx127x](https://github.com/nopnop2002/esp-idf-sx127x). Thanks to nopnop2002 for the SX127x ESP-IDF component.
 
-**Status:** Only **single-hop** operation is currently stable and supported.  
-Multi-hop routing will be added later.
+**Status:** **Multi-hop parent-child** forwarding is supported: DATA and unicast traffic (e.g. TDMA, ping) follow the static tree in `node_config` (parent/children). Relays forward in their TDMA slot. **SYNC and TDMA** are sent single-hop; root should be in range of all nodes for control, or all nodes in range of root.
 
 ---
 

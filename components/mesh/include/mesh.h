@@ -52,6 +52,8 @@ void mesh_init(void);
 bool ping(uint16_t target);
 void restart_root(void);
 void reset_lora(void);
+/** Return radio to RX continuous (e.g. after root CLI ping so root can receive again). */
+void mesh_start_rx_continuous(void);
 
 /**
  * @brief Get current mesh node ID.
@@ -113,4 +115,7 @@ void mesh_set_app_payload(const uint8_t *data, uint16_t len);
 /** Optional callback when root receives a DATA packet (for cycle tracking / CSV). */
 typedef void (*mesh_data_at_root_cb_t)(uint16_t node_id, const uint8_t *payload, uint16_t len, int rssi, float snr);
 void mesh_register_data_at_root_cb(mesh_data_at_root_cb_t cb);
+
+/** Optional callback when root receives JOIN (node_id, interval_byte). Root may set online and decide remesh. */
+void mesh_register_join_callback(void (*cb)(uint16_t node_id, uint8_t interval_byte));
 
