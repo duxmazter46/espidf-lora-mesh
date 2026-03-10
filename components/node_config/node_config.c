@@ -47,11 +47,12 @@ static const routing_policy_type_t ROUTING_POLICY =
     ROUTING_STRICT_TREE;
 
 
+    /* Strict tree: root → node1 → node2 (node2 only via node1). */
     static const nodecfg_topology_t topo_table[] = {
 
-    [0]  = { .parent_id = 0xFFFF, .children = {1, 2}, .child_count = 2 },
-    [1]  = { .parent_id = 0, .child_count = 0 },
-    [2]  = { .parent_id = 0, .child_count = 0 },
+    [0]  = { .parent_id = 0xFFFF, .children = {1}, .child_count = 1 },
+    [1]  = { .parent_id = 0, .children = {2}, .child_count = 1 },
+    [2]  = { .parent_id = 1, .child_count = 0 },
 
     //Lab setup
     //[21]  = { .parent_id = 0xFFFF, .children = {20}, .child_count = 1 },
@@ -195,4 +196,17 @@ uint8_t nodecfg_get_power_policy(uint16_t node_id)
 uint16_t nodecfg_get_topo_table_size(void)
 {
     return sizeof(topo_table) / sizeof(topo_table[0]);
+}
+
+bool nodecfg_is_direct_child(uint16_t parent_id, uint16_t node_id)
+{
+    uint16_t table_size = (uint16_t)(sizeof(topo_table) / sizeof(topo_table[0]));
+    if (parent_id >= table_size)
+        return false;
+    const nodecfg_topology_t *t = &topo_table[parent_id];
+    for (uint8_t i = 0; i < t->child_count; i++) {
+        if (t->children[i] == node_id)
+            return true;
+    }
+    return false;
 }

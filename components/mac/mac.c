@@ -115,6 +115,12 @@ static uint32_t mac_calculate_lora_airtime_us(uint16_t payload_len)
     return (uint32_t)(t_packet * 1e6);
 }
 
+uint32_t mac_lora_airtime_us_for_payload(uint16_t mac_payload_len)
+{
+    uint16_t total_len = (uint16_t)(sizeof(mac_header_t) + mac_payload_len);
+    return mac_calculate_lora_airtime_us(total_len);
+}
+
 static uint16_t mac_generate_frm_id(void)
 {
     uint32_t rnd = esp_random();

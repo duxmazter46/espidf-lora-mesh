@@ -123,8 +123,21 @@ static void net_mac_event_handler(mac_event_type_t type, void *event_data)
                     break;
                 }
 
-                /* Pass any "for me" unicast to app (e.g. ping) even if payload is short */
+                /* Unicast MAC-for-me: check final destination; forward if not for us. */
                 if (rx->dst == net_self_id) {
+                    if (rx->payload_len >= sizeof(net_header_t)) {
+                        net_header_t *hdr = (net_header_t *)rx->payload;
+                        uint8_t *net_payload = rx->payload + sizeof(net_header_t);
+                        uint16_t net_len = rx->payload_len - sizeof(net_header_t);
+                        if (hdr->dst != net_self_id && forward_callback) {
+                            /* Relay: final destination is another node. */
+                            ESP_LOGI(TAG,
+                                "FWD: src=%u → dst=%u pkt=%u ttl=%u len=%u",
+                                hdr->src, hdr->dst, hdr->pkt_id, hdr->ttl, net_len);
+                            forward_callback(rx, hdr, net_payload, net_len);
+                            break;
+                        }
+                    }
                     if (app_rx_callback)
                         app_rx_callback(rx);
                     break;

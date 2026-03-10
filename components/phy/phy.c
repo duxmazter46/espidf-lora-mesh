@@ -658,7 +658,8 @@ phy_init(void)
     gpio_install_isr_service(0);
     gpio_isr_handler_add(CONFIG_DIO0_GPIO, phy_dio0_isr, NULL);
 
-    xTaskCreate(phy_task, "phy_task", 4096, NULL, 5, NULL);
+    /* Stack 6KB: RX path runs mesh_net_rx_handler -> mesh_process_packet (and xTaskCreate) in this task; 4KB overflows. */
+    xTaskCreate(phy_task, "phy_task", 6144, NULL, 5, NULL);
 
 
    /*

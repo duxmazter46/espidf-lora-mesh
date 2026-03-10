@@ -2,6 +2,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include "mesh.h"
+#include "mac.h"
 #include "phy.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -13,6 +14,13 @@
 #include "root_log.h"
 
 #define TAG "MESH"
+
+/* =========================
+   Architecture: ROOT / RELAY / LEAF (see docs/ARCHITECTURE.md)
+   - ROOT: many tasks; normally only TX in free slot (downlink).
+   - RELAY: downlink notify from parent (TDMA/SYNC); uplink own DATA; uplink forward children.
+   - LEAF:  uplink own DATA; uplink request info/changes (later).
+   ========================= */
 
 /* =========================
    Non-root state (clear indication for logging/debug)
@@ -54,6 +62,8 @@ static portMUX_TYPE app_tx_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Updated on any RX "for me" (broadcast or unicast); used by wait tasks to avoid LoRa reset when root pings etc. */
 static volatile TickType_t mesh_last_rx_for_me_ticks = 0;
+/* Updated on any RX (for CAD simulation: channel busy if recent). */
+static volatile TickType_t mesh_any_rx_ticks = 0;
 
 /* =========================
    Node Status Table (root only)
@@ -67,6 +77,15 @@ typedef struct {
 } mesh_node_status_t;
 
 static mesh_node_status_t node_status_table[MESH_MAX_NODES];
+
+/* Child TDMA cache: when relaying TDMA to a child, store for first-half slot downlink. */
+#define MESH_CHILD_TDMA_CACHE_MAX NODECFG_MAX_CHILDREN
+static mesh_tdma_payload_t child_tdma_cache[MESH_CHILD_TDMA_CACHE_MAX];
+static bool child_tdma_valid[MESH_CHILD_TDMA_CACHE_MAX];
+
+/* Relay: cache SYNC epoch from parent so we downlink SYNC to children in our next slot (battery-saver children need force wake). */
+static uint64_t sync_epoch_for_children = 0;
+static bool sync_epoch_for_children_valid = false;
 
 typedef struct {
     uint8_t type;
@@ -101,6 +120,9 @@ static void mesh_forward_handler(
 
 static void mesh_net_rx_handler(mac_rx_event_t *rx);
 
+/** Called by non-root when child JOIN is synced: forward JOIN to parent after 500 ms listen. */
+void mesh_schedule_join_forward_to_parent(const uint8_t *payload, uint16_t len);
+
 static mesh_data_at_root_cb_t s_data_at_root_cb = NULL;
 
 typedef void (*mesh_join_cb_t)(uint16_t node_id, uint8_t interval_byte);
@@ -122,6 +144,10 @@ static mesh_join_cb_t s_join_cb = NULL;
            return final_dst;  /* fallback: direct (single-hop) */
        }
 
+       /* Non-root: downward to child/subtree → first hop toward target; else upward to parent. */
+       uint16_t first = nodecfg_get_first_hop_toward(mesh_node_id, final_dst);
+       if (first != 0xFFFF)
+           return first;
        return my_topology.parent_id;      /* upward tree routing */
    }
 
@@ -151,11 +177,101 @@ static const char *mesh_nonroot_state_str(mesh_nonroot_state_t s)
 }
 
 #define MESH_JOIN_PAYLOAD_MAX 8
+#define MESH_JOIN_CAD_MS 500
+
+static uint8_t s_join_forward_payload[MESH_JOIN_PAYLOAD_MAX];
+static uint16_t s_join_forward_len = 0;
+static uint16_t s_sync_child_id = 0xFFFF;
+
+/* Root: when direct child sends broadcast JOIN, defer SYNC by 500ms + CAD (like non-root). */
+static uint16_t s_root_sync_child_id = 0xFFFF;
+static uint8_t  s_root_sync_interval_byte = 0;
+
+static void mesh_root_sync_child_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(MESH_JOIN_CAD_MS));
+        TickType_t now = xTaskGetTickCount();
+        if ((now - mesh_any_rx_ticks) > pdMS_TO_TICKS(MESH_JOIN_CAD_MS)) {
+            if (s_root_sync_child_id != 0xFFFF && mesh_node_id == nodecfg_get_root_id()) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                uint64_t epoch_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+                mesh_send_to(s_root_sync_child_id, MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
+                uint16_t id = s_root_sync_child_id;
+                uint8_t interval_byte = s_root_sync_interval_byte;
+                s_root_sync_child_id = 0xFFFF;
+                mesh_set_node_online(id, true);
+                if (s_join_cb)
+                    s_join_cb(id, interval_byte);
+                ESP_LOGI(TAG, "JOIN from direct child %u → SYNC sent, marked ONLINE", (unsigned)id);
+            }
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+}
+
+/** Runs in its own task so we do not block the PHY RX path (avoids stack overflow / deadlock). */
+/* Delay so parent's MAC ACK finishes on air before we send SYNC (PHY TX is non-blocking). */
+#define MESH_SYNC_AFTER_ACK_MS 150
+
+static void mesh_sync_child_and_forward_task(void *arg)
+{
+    (void)arg;
+    if (s_sync_child_id == 0xFFFF || my_topology.parent_id == 0xFFFF)
+        goto done;
+    /* Let parent's ACK complete and be received by child before we send SYNC. */
+    vTaskDelay(pdMS_TO_TICKS(MESH_SYNC_AFTER_ACK_MS));
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t epoch_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+    bool ack = mesh_send_to(s_sync_child_id, MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
+    s_sync_child_id = 0xFFFF;
+    if (ack && s_join_forward_len > 0 && s_join_forward_len <= MESH_JOIN_PAYLOAD_MAX) {
+        ESP_LOGI(TAG, "Synced child, notifying parent");
+        mesh_schedule_join_forward_to_parent(s_join_forward_payload, s_join_forward_len);
+    }
+done:
+    vTaskDelete(NULL);
+}
+
+static void mesh_join_forward_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(MESH_JOIN_CAD_MS));
+        TickType_t now = xTaskGetTickCount();
+        if ((now - mesh_any_rx_ticks) > pdMS_TO_TICKS(MESH_JOIN_CAD_MS)) {
+            uint16_t parent = my_topology.parent_id;
+            if (parent != 0xFFFF && s_join_forward_len > 0 && s_join_forward_len <= MESH_JOIN_PAYLOAD_MAX) {
+                mesh_send_to(parent, MESH_PKT_JOIN, s_join_forward_payload, s_join_forward_len);
+                ESP_LOGI(TAG, "Forwarded JOIN to parent %u", (unsigned)parent);
+            }
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+}
+
+void mesh_schedule_join_forward_to_parent(const uint8_t *payload, uint16_t len)
+{
+    if (len > MESH_JOIN_PAYLOAD_MAX || my_topology.parent_id == 0xFFFF)
+        return;
+    memcpy(s_join_forward_payload, payload, len);
+    s_join_forward_len = len;
+    /* Stack 4KB: task calls mesh_send_to to parent; 2KB can overflow with MAC/NET stack. */
+    xTaskCreate(mesh_join_forward_task, "join_fwd", 4096, NULL, 3, NULL);
+}
+
 static void mesh_wait_sync_task(void *arg)
 {
     mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_SYNC;
-    ESP_LOGI(TAG, "State → %s (broadcasting JOIN once, then listening for SYNC)",
-             mesh_nonroot_state_str(mesh_nonroot_state));
+    bool unicast_join = nodecfg_has_static_topology() && (my_topology.parent_id != 0xFFFF);
+    ESP_LOGI(TAG, "State → %s (%s JOIN once, then listening for SYNC)",
+             mesh_nonroot_state_str(mesh_nonroot_state),
+             unicast_join ? "unicast" : "broadcasting");
 
     uint8_t join_payload[MESH_JOIN_PAYLOAD_MAX];
     uint16_t id_payload = mesh_node_id;
@@ -164,9 +280,25 @@ static void mesh_wait_sync_task(void *arg)
     join_payload[sizeof(id_payload)] = (reporting_interval_s > 255) ? 255 : (uint8_t)reporting_interval_s;
     uint16_t join_len = sizeof(id_payload) + 1;
 
-    ESP_LOGI(TAG, "[%s] Broadcasting JOIN (node %u)",
-             mesh_nonroot_state_str(mesh_nonroot_state), mesh_node_id);
-    mesh_send(MESH_PKT_JOIN, join_payload, join_len);
+    /* CAD simulation: listen 500 ms; if channel clear, send JOIN; else postpone. */
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(MESH_JOIN_CAD_MS));
+        TickType_t now = xTaskGetTickCount();
+        if ((now - mesh_any_rx_ticks) > pdMS_TO_TICKS(MESH_JOIN_CAD_MS)) {
+            break;
+        }
+        ESP_LOGD(TAG, "Channel busy, postponing JOIN");
+    }
+
+    if (unicast_join) {
+        ESP_LOGI(TAG, "[%s] Unicast JOIN to parent %u (node %u)",
+                 mesh_nonroot_state_str(mesh_nonroot_state), (unsigned)my_topology.parent_id, mesh_node_id);
+        mesh_send_to(my_topology.parent_id, MESH_PKT_JOIN, join_payload, join_len);
+    } else {
+        ESP_LOGI(TAG, "[%s] Broadcasting JOIN (node %u)",
+                 mesh_nonroot_state_str(mesh_nonroot_state), mesh_node_id);
+        mesh_send(MESH_PKT_JOIN, join_payload, join_len);
+    }
 
     phy_start_rx_continuous();
 
@@ -323,13 +455,14 @@ static void mesh_running_task(void *arg)
     uint16_t report_every = my_tdma_slot.report_every_n_cycles;
     uint8_t  report_offset = my_tdma_slot.report_cycle_offset;
     uint8_t  slot_ix   = my_tdma_slot.slot_index;
+    static bool first_slot_done = false;  /* relay: first cycle = TDMA downlink then own DATA; second+ = own then forward */
 
     if (report_every == 0)
         report_every = 1;
 
-    ESP_LOGI(TAG, "RUNNING: anchor=%llu base_ms=%lu slot_ms=%lu report_every=%u offset=%u slot_ix=%u",
+    ESP_LOGI(TAG, "RUNNING: anchor=%llu base_ms=%lu slot_ms=%lu report_every=%u offset=%u slot_ix=%u children=%u",
              (unsigned long long)anchor, (unsigned long)base_ms, (unsigned long)slot_ms,
-             (unsigned)report_every, (unsigned)report_offset, (unsigned)slot_ix);
+             (unsigned)report_every, (unsigned)report_offset, (unsigned)slot_ix, (unsigned)my_topology.child_count);
 
     for (;;) {
         struct timeval tv;
@@ -366,22 +499,62 @@ static void mesh_running_task(void *arg)
             continue;
         }
 
-        /* Drain forwarded packets first (multi-hop up): send in our slot to avoid collisions. */
-        const int max_forwards_per_slot = 2;
-        for (int i = 0; i < max_forwards_per_slot && mesh_tx_queue != NULL; i++) {
-            mesh_tx_job_t job;
-            if (xQueueReceive(mesh_tx_queue, &job, 0) != pdPASS)
-                break;
-            ESP_LOGI(TAG, "Forwarding in slot → %u (%u bytes)", (unsigned)job.next_hop, (unsigned)job.len);
-            mac_send(job.next_hop, job.buffer, job.len);
-            vTaskDelay(pdMS_TO_TICKS(400));  /* allow TX + ACK to complete */
-        }
-
-        /* Within our slot: keep trying until success or slot end minus guard time. */
-        const uint32_t guard_ms = 500;  /* leave ~500 ms before slot end */
+        const uint32_t guard_ms = 500;
         uint64_t slot_end_guard_ms = slot_start_ms + (slot_ms > guard_ms ? (slot_ms - guard_ms) : slot_ms);
         bool slot_success = false;
+        bool has_children = (my_topology.child_count > 0);
 
+        /* ----- RELAY DOWNLINK: notify children with info from parent (TDMA, SYNC from last cycle free slot). ----- */
+        if (has_children && !first_slot_done) {
+            uint32_t half_ms = (slot_ms > guard_ms) ? ((slot_ms - guard_ms) / 2) : 0;
+            uint64_t phase1_end_ms = slot_start_ms + half_ms;
+            for (int i = 0; i < my_topology.child_count && i < MESH_CHILD_TDMA_CACHE_MAX; i++) {
+                if (!child_tdma_valid[i])
+                    continue;
+                gettimeofday(&tv, NULL);
+                now_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+                if (now_ms >= phase1_end_ms)
+                    break;
+                mesh_send_to(my_topology.children[i], MESH_PKT_TDMA, (uint8_t *)&child_tdma_cache[i], sizeof(mesh_tdma_payload_t));
+                vTaskDelay(pdMS_TO_TICKS(400));
+            }
+            /* Downlink SYNC to children (from root's periodic unicast); battery-saver children need force wake. */
+            if (sync_epoch_for_children_valid) {
+                for (int i = 0; i < my_topology.child_count; i++) {
+                    mesh_send_to(my_topology.children[i], MESH_PKT_SYNC, (uint8_t *)&sync_epoch_for_children, sizeof(sync_epoch_for_children));
+                    vTaskDelay(pdMS_TO_TICKS(400));
+                }
+                sync_epoch_for_children_valid = false;
+                ESP_LOGI(TAG, "SYNC downlink to %u children", (unsigned)my_topology.child_count);
+            }
+            vTaskDelay(pdMS_TO_TICKS(guard_ms));
+            /* Fall through to RELAY UPLINK own DATA (same loop below). */
+        } else if (has_children && first_slot_done) {
+            /* RELAY DOWNLINK (second+ cycle): SYNC to children if cached; then RELAY UPLINK own DATA + forward. */
+            if (sync_epoch_for_children_valid) {
+                for (int i = 0; i < my_topology.child_count; i++) {
+                    mesh_send_to(my_topology.children[i], MESH_PKT_SYNC, (uint8_t *)&sync_epoch_for_children, sizeof(sync_epoch_for_children));
+                    vTaskDelay(pdMS_TO_TICKS(400));
+                }
+                sync_epoch_for_children_valid = false;
+                ESP_LOGI(TAG, "SYNC downlink to %u children", (unsigned)my_topology.child_count);
+            }
+        }
+
+        /* ----- LEAF UPLINK: request info/changes (later); for now drain forward queue to parent. ----- */
+        if (!has_children) {
+            const int max_forwards_per_slot = 2;
+            for (int i = 0; i < max_forwards_per_slot && mesh_tx_queue != NULL; i++) {
+                mesh_tx_job_t job;
+                if (xQueueReceive(mesh_tx_queue, &job, 0) != pdPASS)
+                    break;
+                ESP_LOGI(TAG, "Forwarding in slot → %u (%u bytes)", (unsigned)job.next_hop, (unsigned)job.len);
+                mac_send(job.next_hop, job.buffer, job.len);
+                vTaskDelay(pdMS_TO_TICKS(400));
+            }
+        }
+
+        /* ----- RELAY/LEAF UPLINK: own DATA packet to parent. ----- */
         while (!slot_success) {
             gettimeofday(&tv, NULL);
             now_ms = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
@@ -445,6 +618,21 @@ static void mesh_running_task(void *arg)
             mesh_failed_slots = 0;
         }
 
+        /* ----- RELAY UPLINK: forward children's packets to parent. ----- */
+        if (has_children && first_slot_done && mesh_tx_queue != NULL) {
+            const int max_forwards_per_slot = 2;
+            for (int i = 0; i < max_forwards_per_slot; i++) {
+                mesh_tx_job_t job;
+                if (xQueueReceive(mesh_tx_queue, &job, 0) != pdPASS)
+                    break;
+                ESP_LOGI(TAG, "Forwarding in slot → %u (%u bytes)", (unsigned)job.next_hop, (unsigned)job.len);
+                mac_send(job.next_hop, job.buffer, job.len);
+                vTaskDelay(pdMS_TO_TICKS(400));
+            }
+        }
+
+        first_slot_done = true;
+
         /* Wait until next cycle (our next report cycle). */
         cycle_index++;
         while ((cycle_index % report_every) != (uint64_t)report_offset)
@@ -469,6 +657,7 @@ static void mesh_running_task(void *arg)
 void mesh_start_runtime(void)
 {
     nodecfg_get_topology(mesh_node_id, &my_topology);
+    memset(child_tdma_valid, 0, sizeof(child_tdma_valid));
 
     net_init(mesh_node_id);
     net_register_routing_callback(mesh_get_next_hop);
@@ -483,16 +672,12 @@ void mesh_start_runtime(void)
     phy_start_rx_continuous();
 
     if (mesh_node_id == nodecfg_get_root_id()) {
-        ESP_LOGI(TAG, "ROOT NODE STARTED");
-        struct timeval _tv;
-        gettimeofday(&_tv, NULL);
-        uint64_t epoch_ms = (uint64_t)_tv.tv_sec * 1000 + (uint64_t)_tv.tv_usec / 1000;
-        ESP_LOGI(TAG, "Broadcasting SYNC with epoch_ms=%llu", (unsigned long long)epoch_ms);
-        mesh_send(MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
+        ESP_LOGI(TAG, "ROOT NODE STARTED (no SYNC at start; adjacency via ping only)");
     } else {
         mesh_sync_received = false;
         mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_SYNC;
-        ESP_LOGI(TAG, "Non-root: starting WAIT_FOR_SYNC (broadcasting JOIN)");
+        ESP_LOGI(TAG, "Non-root: starting WAIT_FOR_SYNC (%s JOIN)",
+                 (nodecfg_has_static_topology() && my_topology.parent_id != 0xFFFF) ? "unicast" : "broadcast");
         xTaskCreate(mesh_wait_sync_task, "sync_wait", 4096, NULL, 4, &sync_tdma_wait_task);
     }
 }
@@ -526,20 +711,26 @@ void mesh_init(void)
     mesh_start_runtime();
 }
 
-/* Payload is root's clock as uint64_t epoch milliseconds (UTC). */
-static void mesh_handle_sync_clock(uint8_t *payload, uint16_t len)
+/* Payload is root's clock as uint64_t epoch ms (UTC). Apply LoRa airtime compensation (Class-B style). */
+static void mesh_handle_sync_clock(uint8_t *payload, uint16_t len, uint16_t mac_payload_len)
 {
-    if (len >= sizeof(uint64_t)) {
-        uint64_t epoch_ms;
-        memcpy(&epoch_ms, payload, sizeof(epoch_ms));
+    if (len < sizeof(uint64_t))
+        return;
+    uint64_t epoch_ms;
+    memcpy(&epoch_ms, payload, sizeof(epoch_ms));
 
-        struct timeval tv;
-        tv.tv_sec  = (time_t)(epoch_ms / 1000);
-        tv.tv_usec = (suseconds_t)((epoch_ms % 1000) * 1000);
-        settimeofday(&tv, NULL);
+    /* Compensate for LoRa airtime: root timestamp ≈ TX start, we receive after airtime. */
+    uint32_t airtime_us = mac_lora_airtime_us_for_payload(mac_payload_len);
+    uint64_t airtime_ms = (uint64_t)(airtime_us / 1000);
+    uint64_t corrected_ms = epoch_ms + airtime_ms;
 
-        ESP_LOGI(TAG, "Clock synced from SYNC: epoch_ms=%llu", (unsigned long long)epoch_ms);
-    }
+    struct timeval tv;
+    tv.tv_sec  = (time_t)(corrected_ms / 1000);
+    tv.tv_usec = (suseconds_t)((corrected_ms % 1000) * 1000);
+    settimeofday(&tv, NULL);
+
+    ESP_LOGI(TAG, "Clock synced from SYNC: epoch_ms=%llu + airtime=%lu ms → corrected=%llu",
+             (unsigned long long)epoch_ms, (unsigned long)airtime_ms, (unsigned long long)corrected_ms);
 }
 
 static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
@@ -552,44 +743,88 @@ static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
     switch (mhdr->type) {
         case MESH_PKT_JOIN:
             if (mesh_node_id == nodecfg_get_root_id()) {
+                /* ROUTING_STRICT_TREE: root only accepts JOIN from direct children (prev_hop). */
+                if (nodecfg_get_routing_policy() == ROUTING_STRICT_TREE && rx != NULL) {
+                    uint16_t prev = rx->prev_hop;
+                    if (!nodecfg_is_direct_child(nodecfg_get_root_id(), prev)) {
+                        ESP_LOGI(TAG, "Strict tree: ignore JOIN from non-child prev_hop=%u", (unsigned)prev);
+                        break;
+                    }
+                }
                 uint16_t joining_id = 0;
                 uint8_t interval_byte = 0;
                 if (mesh_len >= sizeof(uint16_t))
                     memcpy(&joining_id, mesh_payload, sizeof(joining_id));
                 if (mesh_len >= 3)
                     interval_byte = mesh_payload[2];
-                if (s_join_cb) {
-                    s_join_cb(joining_id, interval_byte);
+                /* JOIN from direct child (broadcast or unicast): defer SYNC like non-root (500ms + CAD, then unicast SYNC). */
+                if (nodecfg_is_direct_child(nodecfg_get_root_id(), joining_id)) {
+                    s_root_sync_child_id = joining_id;
+                    s_root_sync_interval_byte = interval_byte;
+                    xTaskCreate(mesh_root_sync_child_task, "root_sync", 4096, NULL, 3, NULL);
+                    ESP_LOGI(TAG, "JOIN from direct child %u → scheduled SYNC in 500ms (CAD)", (unsigned)joining_id);
                 } else {
-                    mesh_set_node_online(joining_id, true);
+                    /* Forwarded JOIN (grandchild etc.): mark ONLINE immediately. */
+                    if (s_join_cb) {
+                        s_join_cb(joining_id, interval_byte);
+                    } else {
+                        mesh_set_node_online(joining_id, true);
+                    }
+                    ESP_LOGI(TAG, "JOIN from node %u (interval_byte=%u) -> marked ONLINE", joining_id, (unsigned)interval_byte);
                 }
-                ESP_LOGI(TAG, "JOIN from node %u (interval_byte=%u) -> marked ONLINE", joining_id, (unsigned)interval_byte);
+            } else {
+                /* Non-root: if JOIN is from my child (broadcast or prev_hop), sync child then notify parent. */
+                uint16_t joining_id = 0;
+                if (mesh_len >= sizeof(uint16_t))
+                    memcpy(&joining_id, mesh_payload, sizeof(joining_id));
+                bool is_my_child = false;
+                for (int i = 0; i < my_topology.child_count; i++) {
+                    if (my_topology.children[i] == joining_id) {
+                        is_my_child = true;
+                        break;
+                    }
+                }
+                if (is_my_child && rx != NULL && rx->prev_hop == joining_id) {
+                    /* Defer sync+forward to a task so we do not block PHY RX path (stack overflow / deadlock). */
+                    if (mesh_len > 0 && mesh_len <= MESH_JOIN_PAYLOAD_MAX) {
+                        s_sync_child_id = joining_id;
+                        memcpy(s_join_forward_payload, mesh_payload, mesh_len);
+                        s_join_forward_len = mesh_len;
+                        /* Stack 4KB: task calls mesh_send_to -> net_send -> mac_send (blocking + logging); 2KB overflows. */
+                        xTaskCreate(mesh_sync_child_and_forward_task, "sync_ch", 4096, NULL, 3, NULL);
+                    }
+                }
             }
             break;
 
         case MESH_PKT_SYNC:
             if (mesh_node_id != nodecfg_get_root_id()) {
-                ESP_LOGI(TAG, "SYNC received → leaving WAIT_FOR_SYNC");
+                mesh_handle_sync_clock(mesh_payload, mesh_len, rx ? rx->payload_len : 0);
 
-                mesh_handle_sync_clock(mesh_payload, mesh_len);
-
-                mesh_sync_received = true;
-
-                if (nodecfg_has_static_topology()) {
-                    mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_TDMA;
-                    ESP_LOGI(TAG, "Static topology → skipping ASSIGN, State → WAIT_FOR_TDMA");
-                } else {
-                    mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_ASSIGN;
-                    ESP_LOGI(TAG, "State → %s", mesh_nonroot_state_str(mesh_nonroot_state));
+                /* Relay: cache epoch to downlink SYNC to children in our next slot (children may need force wake if battery saver). */
+                if (my_topology.child_count > 0 && mesh_len >= sizeof(uint64_t)) {
+                    memcpy(&sync_epoch_for_children, mesh_payload, sizeof(uint64_t));
+                    sync_epoch_for_children_valid = true;
                 }
 
-                if (sync_tdma_wait_task != NULL) {
-                    vTaskDelete(sync_tdma_wait_task);
-                    sync_tdma_wait_task = NULL;
+                /* Only leave WAIT_FOR_SYNC / transition state when we were waiting. Ignore periodic SYNC when already RUNNING. */
+                if (mesh_nonroot_state == MESH_NONROOT_STATE_WAIT_FOR_SYNC) {
+                    ESP_LOGI(TAG, "SYNC received → leaving WAIT_FOR_SYNC");
+                    mesh_sync_received = true;
+                    if (nodecfg_has_static_topology()) {
+                        mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_TDMA;
+                        ESP_LOGI(TAG, "Static topology → skipping ASSIGN, State → WAIT_FOR_TDMA");
+                    } else {
+                        mesh_nonroot_state = MESH_NONROOT_STATE_WAIT_FOR_ASSIGN;
+                        ESP_LOGI(TAG, "State → %s", mesh_nonroot_state_str(mesh_nonroot_state));
+                    }
+                    if (sync_tdma_wait_task != NULL) {
+                        vTaskDelete(sync_tdma_wait_task);
+                        sync_tdma_wait_task = NULL;
+                    }
+                    phy_start_rx_continuous();
                 }
-
-                /* Ensure we are in RX so we can receive the upcoming TDMA unicast */
-                phy_start_rx_continuous();
+                /* If already WAIT_FOR_TDMA or RUNNING, we only applied clock; no state change. */
             }
             break;
 
@@ -606,14 +841,16 @@ static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
                 if (mesh_len >= sizeof(mesh_tdma_payload_t)) {
                     memcpy(&my_tdma_slot, mesh_payload, sizeof(mesh_tdma_payload_t));
                     my_schedule_hash = my_tdma_slot.schedule_hash;
-                    ESP_LOGI(TAG, "TDMA received: base_ms=%lu slot_ms=%lu full_cycles=%u report_every=%u offset=%u slot=%u anchor=%llu hash=0x%08X",
+                    ESP_LOGI(TAG, "TDMA received: base_ms=%lu slot_ms=%lu full_cycles=%u report_every=%u offset=%u slot=%u bootstrap_cycles=%u anchor=%llu runtime_anchor=%llu hash=0x%08X",
                              (unsigned long)my_tdma_slot.base_period_ms,
                              (unsigned long)my_tdma_slot.slot_duration_ms,
                              (unsigned)my_tdma_slot.full_cycle_cycles,
                              (unsigned)my_tdma_slot.report_every_n_cycles,
                              (unsigned)my_tdma_slot.report_cycle_offset,
                              (unsigned)my_tdma_slot.slot_index,
+                             (unsigned)my_tdma_slot.bootstrap_cycles,
                              (unsigned long long)my_tdma_slot.anchor_epoch_ms,
+                             (unsigned long long)my_tdma_slot.runtime_anchor_epoch_ms,
                              (unsigned)my_schedule_hash);
                 } else {
                     ESP_LOGW(TAG, "TDMA payload too short (%u < %u)",
@@ -650,6 +887,7 @@ static void mesh_process_packet(mesh_header_t *mhdr, uint8_t *mesh_payload,
 
 static void mesh_net_rx_handler(mac_rx_event_t *rx)
 {
+    mesh_any_rx_ticks = xTaskGetTickCount();
     /* Any RX to this node (broadcast or unicast) restarts the "no progress" timer on non-root */
     if (mesh_node_id != nodecfg_get_root_id())
         mesh_last_rx_for_me_ticks = xTaskGetTickCount();
@@ -838,6 +1076,19 @@ static void mesh_forward_handler(
         if (next_hop == 0xFFFF) {
             ESP_LOGW(TAG, "Drop: dst %u not in my subtree (last_hop=%u)", (unsigned)hdr->dst, (unsigned)last_hop);
             return;
+        }
+        /* Cache TDMA for this child so we can re-send in our slot first half (TDMA downlink). */
+        if (len >= sizeof(mesh_header_t) + sizeof(mesh_tdma_payload_t)) {
+            mesh_header_t *mh = (mesh_header_t *)payload;
+            if (mh->type == MESH_PKT_TDMA) {
+                for (int i = 0; i < my_topology.child_count && i < MESH_CHILD_TDMA_CACHE_MAX; i++) {
+                    if (my_topology.children[i] == next_hop) {
+                        memcpy(&child_tdma_cache[i], payload + sizeof(mesh_header_t), sizeof(mesh_tdma_payload_t));
+                        child_tdma_valid[i] = true;
+                        break;
+                    }
+                }
+            }
         }
     } else {
         ESP_LOGW(TAG, "Drop: not from my child or parent (last_hop=%u src=%u)",

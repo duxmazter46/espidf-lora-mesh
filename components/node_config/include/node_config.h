@@ -55,6 +55,9 @@ void nodecfg_get_topology(uint16_t node_id,
 /** First hop from from_node toward target (direct child on path to target). Returns 0xFFFF if not in tree. */
 uint16_t nodecfg_get_first_hop_toward(uint16_t from_node, uint16_t target);
 
+/** True if node_id is a direct child of parent_id (for ROUTING_STRICT_TREE: root only accepts from direct children). */
+bool nodecfg_is_direct_child(uint16_t parent_id, uint16_t node_id);
+
 /** Per-node reporting interval in seconds (e.g. 60 = 1 min, 600 = 10 min). Default 60. */
 uint32_t nodecfg_get_reporting_interval_s(uint16_t node_id);
 

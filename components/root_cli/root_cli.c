@@ -24,9 +24,11 @@
 
 #define TAG "ROOT_CLI"
 
+/* ROOT role (see docs/ARCHITECTURE.md): many tasks; normally only TX in free slot (downlink: resync, periodic SYNC). */
+
 /* Drift model: SYNC every N cycles so relative drift stays under DRIFT_BOUND_MS.
    DRIFT_PPM = worst-case relative clock drift (ppm); 40 = 20 ppm per node × 2. */
-#define DRIFT_BOUND_MS  100
+#define DRIFT_BOUND_MS  50
 #define DRIFT_PPM       40
 
 /** Returns ceil(DRIFT_BOUND_MS / (DRIFT_PPM * 1e-6 * cycle_ms)); min 1. */
@@ -96,6 +98,9 @@ static uint64_t s_anchor_epoch_ms = 0;
 static uint32_t s_base_period_ms  = 0;
 static uint16_t s_full_cycle_cycles = 0;
 static uint32_t s_tdma_hash = 0;
+/* Bootstrap/runtime TDMA parameters (anchor for runtime and number of bootstrap base cycles). */
+static uint16_t s_bootstrap_cycles = 1;          /* default: 1 bootstrap cycle */
+static uint64_t s_runtime_anchor_epoch_ms = 0;   /* computed from anchor + bootstrap_cycles * base_period_ms */
 
 static uint32_t tdma_compute_hash(void)
 {
@@ -175,6 +180,8 @@ static bool root_build_tdma_payload_for_node(uint16_t nid, mesh_tdma_payload_t *
     out->report_cycle_offset   = report_cycle_offset;
     out->slot_index            = slot_index;
     out->schedule_hash         = s_tdma_hash;
+    out->bootstrap_cycles      = s_bootstrap_cycles;
+    out->runtime_anchor_epoch_ms = s_runtime_anchor_epoch_ms;
     return true;
 }
 
@@ -333,6 +340,7 @@ static const char *mesh_node_state_str(mesh_node_state_t s)
 static void root_sync_task(void *arg)
 {
     root_sync_task_params_t *p = (root_sync_task_params_t *)arg;
+    uint16_t root_id      = nodecfg_get_root_id();
     uint64_t anchor       = p->anchor_epoch_ms;
     uint32_t base_period_ms = p->base_period_ms;
     uint32_t every        = p->sync_every_cycles;
@@ -372,12 +380,14 @@ static void root_sync_task(void *arg)
             continue;
         }
 
+        /* We are now in the free slot for this cycle (ROOT free-slot downlink only). */
+
         if (remesh_pending) {
             root_do_remesh();
             return;
         }
 
-        /* Re-sync nodes that are ONLINE (no DATA this cycle or hash mismatch): unicast SYNC then TDMA, max 3 attempts. */
+        /* Re-sync tier-1 nodes only (strict tree: root does not PING/SYNC tier-2; parents do). */
         {
             uint64_t epoch_ms = root_get_epoch_ms();
             for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++) {
@@ -387,6 +397,9 @@ static void root_sync_task(void *arg)
                 if (mesh_get_node_state(nid) != MESH_NODE_ONLINE)
                     continue;
                 if (resync_retry_count[nid] >= 3)
+                    continue;
+                /* Only resync direct children of root (tier-1). */
+                if (!nodecfg_is_direct_child(root_id, nid))
                     continue;
                 bool ack = mesh_send_to(nid, MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
                 if (ack) {
@@ -408,10 +421,19 @@ static void root_sync_task(void *arg)
             }
         }
 
+        /* Periodic SYNC: only in free slot and only every 21st cycle; unicast to tier-1 only; relay downlinks SYNC in next slot. */
         if (cycle_index % every == 0) {
             uint64_t epoch_ms = root_get_epoch_ms();
-            mesh_send(MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
-            ESP_LOGI(TAG, "Periodic SYNC broadcast (cycle %lu)", (unsigned long)cycle_index);
+            for (uint16_t i = 0; i < num_online && i < ROOT_MAX_SLOT_NODES; i++) {
+                uint16_t nid = p->slot_to_node[i];
+                if (nid >= ROOT_MAX_SLOT_NODES)
+                    continue;
+                if (!nodecfg_is_direct_child(root_id, nid))
+                    continue;
+                mesh_send_to(nid, MESH_PKT_SYNC, (uint8_t *)&epoch_ms, sizeof(epoch_ms));
+                vTaskDelay(pdMS_TO_TICKS(400));
+            }
+            ESP_LOGI(TAG, "Periodic SYNC unicast to tier-1 in free slot (cycle %lu)", (unsigned long)cycle_index);
         }
 
         /* End of cycle: did we get any DATA from any child this cycle? */
@@ -1126,11 +1148,7 @@ static void cmd_start(int argc, char **argv)
         return;
     }
 
-    /* Phase 1: broadcast SYNC (already sent by mesh_start_runtime) */
-    printf("Waiting 2s for broadcast SYNC to settle...\n");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    /* Phase 2a: ping direct children (tier-1) to verify adjacency */
+    /* Ping direct children (tier-1) only; no SYNC at start — full adjacency from ping. */
     for (uint16_t i = 0; i < num_nonroot; i++) {
         uint16_t nid = nonroot_ids[i];
         nodecfg_topology_t t;
@@ -1149,27 +1167,29 @@ static void cmd_start(int argc, char **argv)
         vTaskDelay(pdMS_TO_TICKS(400));
     }
 
-    /* Phase 2: probe OFFLINE nodes with unicast SYNC */
-    uint64_t epoch_ms = root_get_epoch_ms();
+    /* After ping, require all tier-1 nodes in flashed topology to be ONLINE before building TDMA. */
+    bool all_tier1_online = true;
     for (uint16_t i = 0; i < num_nonroot; i++) {
         uint16_t nid = nonroot_ids[i];
-        if (mesh_is_node_online(nid)) {
-            printf("  Node %u: already ONLINE\n", nid);
+        nodecfg_topology_t t;
+        nodecfg_get_topology(nid, &t);
+        if (t.parent_id != root_id)
             continue;
+        if (!mesh_is_node_online(nid)) {
+            all_tier1_online = false;
+            printf("COMMANDER: Tier-1 node %u OFFLINE at start (topology flashed).\n", nid);
+            if (t.child_count > 0) {
+                printf("  Node %u has %u children; its subtree cannot be scheduled.\n",
+                       nid, (unsigned)t.child_count);
+            }
         }
-        printf("  Node %u OFFLINE, probing with unicast SYNC...\n", nid);
-        bool ack = mesh_send_to(nid, MESH_PKT_SYNC,
-                                (uint8_t *)&epoch_ms, sizeof(epoch_ms));
-        if (ack) {
-            mesh_set_node_online(nid, true);
-            printf("  Node %u responded -> ONLINE\n", nid);
-        } else {
-            printf("  Node %u no response -> stays OFFLINE\n", nid);
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (!all_tier1_online) {
+        printf("At least one tier-1 node is OFFLINE — stopping mesh (no TDMA scheduled). Ensure all tier-1 nodes are online, then run 'start' again.\n");
+        return;
     }
 
-    /* Phase 3: build TDMA table and send per-node schedules */
+    /* Build TDMA table and send per-node schedules */
     uint16_t online_ids[32];
     uint16_t num_online = 0;
     for (uint16_t i = 0; i < num_nonroot; i++) {
@@ -1203,9 +1223,18 @@ static void cmd_start(int argc, char **argv)
     }
 
     uint32_t base_period_ms = base_period_s * 1000;
+    uint64_t epoch_ms = root_get_epoch_ms();
     uint64_t anchor_epoch_ms = ((epoch_ms / (base_period_s * 1000)) + 1) * (uint64_t)base_period_s * 1000;
     if (base_period_s >= 60)
         anchor_epoch_ms = ((epoch_ms / 60000) + 1) * 60000;  /* align to minute when base is 60s */
+
+    /* Bootstrap TDMA vs runtime TDMA:
+     * - Bootstrap anchor: anchor_epoch_ms (first base cycle start).
+     * - Runtime anchor:   anchor_epoch_ms + bootstrap_cycles * base_period_ms.
+     * For now bootstrap_cycles is fixed to 1; later this can be made configurable.
+     */
+    s_bootstrap_cycles = 1;
+    s_runtime_anchor_epoch_ms = anchor_epoch_ms + (uint64_t)s_bootstrap_cycles * base_period_ms;
 
     /* Build TDMA table: for each base cycle c, which nodes report (report_cycle_offset = last in period). */
     tdma_full_cycle_cycles = full_cycle_cycles;
@@ -1227,8 +1256,10 @@ static void cmd_start(int argc, char **argv)
 
     printf("TDMA table: base_period=%lu s, full_period=%lu s, full_cycle_cycles=%u\n",
            (unsigned long)base_period_s, (unsigned long)full_period_s, (unsigned)full_cycle_cycles);
-    printf("Anchor (first cycle start): ");
+    printf("Bootstrap anchor (first base cycle start): ");
     print_human_time(anchor_epoch_ms);
+    printf("Runtime anchor (after %u bootstrap cycle(s)): ", (unsigned)s_bootstrap_cycles);
+    print_human_time(s_runtime_anchor_epoch_ms);
     for (uint16_t c = 0; c < full_cycle_cycles; c++) {
         uint8_t n = tdma_cycle_slot_count[c];
         printf("  Cycle %u: %u slots (", (unsigned)c, (unsigned)n);

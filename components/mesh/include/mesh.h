@@ -19,7 +19,12 @@ typedef enum {
  *  TDMA Payload
  * ============================================================ */
 
-/* TDMA payload: supports variable slots per cycle (e.g. cycles 1-9: 2 slots, cycle 10: 3 slots). */
+/* TDMA payload: supports variable slots per cycle (e.g. cycles 1-9: 2 slots, cycle 10: 3 slots).
+ *
+ * anchor_epoch_ms is the bootstrap TDMA anchor (first base cycle start).
+ * runtime_anchor_epoch_ms is when the steady-state runtime TDMA is considered active
+ * (typically anchor + bootstrap_cycles * base_period_ms).
+ */
 typedef struct {
     uint64_t anchor_epoch_ms;        /* Start of first base cycle (epoch ms). */
     uint32_t base_period_ms;         /* Length of one base TDMA cycle (e.g. 60000 ms). */
@@ -29,6 +34,8 @@ typedef struct {
     uint8_t  report_cycle_offset;    /* Report when (cycle_index % report_every_n_cycles) == this. */
     uint8_t  slot_index;             /* Slot index when this node reports (0 = first, etc.). */
     uint32_t schedule_hash;          /* Deterministic TDMA schedule identity (root-computed). */
+    uint16_t bootstrap_cycles;       /* Number of bootstrap base cycles before runtime TDMA. */
+    uint64_t runtime_anchor_epoch_ms;/* Start of runtime TDMA (usually anchor + bootstrap_cycles * base_period_ms). */
 } __attribute__((packed)) mesh_tdma_payload_t;
 
 /* ============================================================

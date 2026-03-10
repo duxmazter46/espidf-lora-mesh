@@ -90,4 +90,7 @@ bool mac_send(uint16_t dst, uint8_t *payload, uint16_t len);
 void mac_broadcast(uint8_t *payload, uint16_t len);
 void mac_set_mode(mac_operating_mode_t mode);
 
+/** LoRa airtime in µs for a received frame (MAC header + mac_payload_len). Used for SYNC clock compensation (Class-B style). */
+uint32_t mac_lora_airtime_us_for_payload(uint16_t mac_payload_len);
+
 #endif
