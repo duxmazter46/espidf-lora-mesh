@@ -1,4 +1,3 @@
-
 # Network Operation and TDMA Protocol
 
 The proposed protocol combines asynchronous network formation with centrally coordinated TDMA communication. The overall operation of the network is divided into four stages: **network discovery, anchor time establishment, bootstrap cycle, and runtime TDMA cycle**. This design allows nodes to join the network flexibly while enabling deterministic and collision-controlled communication during normal operation.
@@ -70,3 +69,64 @@ Runtime TDMA order example:
 This reversed ordering allows nodes located farther from the root (e.g., Node 2) to transmit earlier in the cycle. As a result, their data packets can propagate upward through intermediate relay nodes within the same cycle, reducing the total latency required for the packet to reach the root node.
 
 Sensor nodes transmit data to their parent relay nodes, which then aggregate and forward the packets toward the root during their assigned slots. Because slot timing is synchronized using the anchor time, packet collisions are minimized and deterministic multi-hop communication can be achieved.
+
+---
+
+## 5. Periodic Synchronization
+
+To maintain timing accuracy across the network, the root node periodically broadcasts SYNC packets during runtime operation. These packets contain the updated anchor time and allow nodes to correct clock drift.
+
+Relay nodes propagate the synchronization packets to downstream nodes, ensuring that the entire network maintains a consistent time reference. Periodic synchronization prevents slot misalignment and ensures that TDMA scheduling remains stable over long operation periods.
+
+---
+
+## 6. Maximum Number of Nodes
+
+The maximum number of nodes supported by the network depends on the TDMA frame size and slot duration.
+
+Each relay node is assigned a dedicated transmission slot within a TDMA cycle. Therefore, the number of relay nodes that can participate in the network is limited by the total number of available slots in the TDMA frame.
+
+Sensor nodes that communicate through relay nodes do not require dedicated slots and therefore do not directly affect the maximum slot allocation. The system can therefore scale by organizing sensor nodes under relay nodes in a hierarchical topology.
+
+---
+
+## 7. Packet Types
+
+The protocol defines several packet types used during different operational stages:
+
+- JOIN  
+  Sent by a node attempting to join the network.
+
+- SYNC  
+  Broadcast by the root node to distribute anchor time.
+
+- TDMA_ASSIGN  
+  Used to distribute TDMA scheduling information during the bootstrap cycle.
+
+- DATA  
+  Used for application data transmission during runtime operation.
+
+---
+
+## 8. TDMA Frame Structure
+
+The TDMA cycle is divided into fixed-length transmission slots.
+
+A typical TDMA frame may contain:
+
+| Slot   | Purpose                   |
+| ------ | ------------------------- |
+| Slot 1 | Relay Node A transmission |
+| Slot 2 | Relay Node B transmission |
+| Slot 3 | Relay Node C transmission |
+| Slot N | Reserved / Free           |
+
+Slot ordering may differ between bootstrap and runtime cycles depending on topology optimization.
+
+---
+
+## 9. Fault Handling and Recovery
+
+Nodes continuously monitor synchronization and TDMA timing. If synchronization packets are not received for several cycles, the node assumes it has lost network synchronization and returns to the discovery phase.
+
+Similarly, if a node fails to transmit within its assigned TDMA slot, the slot remains unused during that cycle. Future protocol versions may include mechanisms for slot reallocation or dynamic topology recovery.
