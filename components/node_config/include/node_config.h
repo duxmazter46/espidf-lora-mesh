@@ -69,3 +69,8 @@ uint32_t nodecfg_get_reporting_interval_s(uint16_t node_id);
 uint8_t nodecfg_get_power_policy(uint16_t node_id);
 
 uint16_t nodecfg_get_topo_table_size(void);
+
+/** Number of nodes in the tree (reachable from root). Use with nodecfg_get_topo_node_id() to iterate. */
+uint16_t nodecfg_get_topo_node_count(void);
+/** Index-th node ID in tree (BFS order: root, then tier-1, ...). Index in [0, nodecfg_get_topo_node_count()). 0xFFFF if out of range. */
+uint16_t nodecfg_get_topo_node_id(uint16_t index);

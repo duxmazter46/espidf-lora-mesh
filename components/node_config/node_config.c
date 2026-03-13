@@ -34,25 +34,22 @@ static const node_map_t node_map[] = {
     {{0x20,0x6E,0xF1,0xC3,0x0A,0xDC}, 17},
     {{0x20,0x6E,0xF1,0xC3,0x8A,0x8C}, 18},
     {{0x20,0x6E,0xF1,0xC3,0x0B,0x08}, 19},
-
-    //Lab setup
     {{0x20,0x6E,0xF1,0xC3,0x0A,0xC8}, 20},
     {{0x20,0x6E,0xF1,0xCB,0xE8,0xDC}, 21},
  
 };
 
-static const uint16_t ROOT_NODE_ID = 0;
+static const uint16_t ROOT_NODE_ID = 7;
 
-static const routing_policy_type_t ROUTING_POLICY =
-    ROUTING_STRICT_TREE;
+static const routing_policy_type_t ROUTING_POLICY = ROUTING_STRICT_TREE;
 
 
     /* Strict tree: root → node1 → node2 (node2 only via node1). */
-    static const nodecfg_topology_t topo_table[] = {
+static const nodecfg_topology_t topo_table[] = {
 
-    [0]  = { .parent_id = 0xFFFF, .children = {1}, .child_count = 1 },
-    [1]  = { .parent_id = 0, .children = {2}, .child_count = 1 },
-    [2]  = { .parent_id = 1, .child_count = 0 },
+    [7]  = { .parent_id = 0xFFFF, .children = {18}, .child_count = 1 },
+    [18]  = { .parent_id = 7, .children = {19}, .child_count = 1 },
+    [19]  = { .parent_id = 18, .child_count = 0 },
 
     //Lab setup
     //[21]  = { .parent_id = 0xFFFF, .children = {20}, .child_count = 1 },
@@ -68,9 +65,9 @@ static const routing_policy_type_t ROUTING_POLICY =
  * Example: node 1 = 60 (1 min), node 2 = 60 or 600 (10 min) for variable slots per cycle.
  * Current setup: all 60 so every cycle has same number of slots (node1, node2, free). */
 static const uint32_t node_reporting_interval_s[] = {
-    [0] = 0,   /* root */
-    [1] = 60,  /* 1 minute */
-    [2] = 60,  /* 1 minute (use 600 for 10-min: cycles 1-9 = 2 slots, cycle 10 = 3 slots) */
+    [7] = 0,   /* root */
+    [18] = 60,  /* 1 minute */
+    [19] = 60,  /* 1 minute (use 600 for 10-min: cycles 1-9 = 2 slots, cycle 10 = 3 slots) */
 };
 
 /* Power policy: default for all nodes. Manual edit per node in node_power_policy[] below if needed.
@@ -196,6 +193,53 @@ uint8_t nodecfg_get_power_policy(uint16_t node_id)
 uint16_t nodecfg_get_topo_table_size(void)
 {
     return sizeof(topo_table) / sizeof(topo_table[0]);
+}
+
+#define NODECFG_TOPO_LIST_MAX 32
+static uint16_t s_topo_node_list[NODECFG_TOPO_LIST_MAX];
+static uint16_t s_topo_node_count;
+static bool s_topo_node_list_valid;
+
+static void build_topo_node_list(void)
+{
+    uint16_t table_size = (uint16_t)(sizeof(topo_table) / sizeof(topo_table[0]));
+    uint16_t root_id = ROOT_NODE_ID;
+    if (root_id >= table_size) {
+        s_topo_node_count = 0;
+        s_topo_node_list_valid = true;
+        return;
+    }
+    uint16_t queue[NODECFG_TOPO_LIST_MAX];
+    int head = 0, tail = 0;
+    queue[tail++] = root_id;
+    s_topo_node_count = 0;
+    while (head < tail && s_topo_node_count < NODECFG_TOPO_LIST_MAX) {
+        uint16_t n = queue[head++];
+        s_topo_node_list[s_topo_node_count++] = n;
+        const nodecfg_topology_t *t = &topo_table[n];
+        for (uint8_t i = 0; i < t->child_count && i < NODECFG_MAX_CHILDREN; i++) {
+            uint16_t c = t->children[i];
+            if (c < table_size && (unsigned)tail < NODECFG_TOPO_LIST_MAX)
+                queue[tail++] = c;
+        }
+    }
+    s_topo_node_list_valid = true;
+}
+
+uint16_t nodecfg_get_topo_node_count(void)
+{
+    if (!s_topo_node_list_valid)
+        build_topo_node_list();
+    return s_topo_node_count;
+}
+
+uint16_t nodecfg_get_topo_node_id(uint16_t index)
+{
+    if (!s_topo_node_list_valid)
+        build_topo_node_list();
+    if (index >= s_topo_node_count)
+        return 0xFFFF;
+    return s_topo_node_list[index];
 }
 
 bool nodecfg_is_direct_child(uint16_t parent_id, uint16_t node_id)

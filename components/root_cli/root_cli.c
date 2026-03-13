@@ -194,16 +194,15 @@ static bool root_all_nodes_in_topo_online(void)
 {
     if (!nodecfg_has_static_topology())
         return false;
-    uint16_t topo_size = nodecfg_get_topo_table_size();
-    uint16_t root_id  = nodecfg_get_root_id();
-    for (uint16_t i = 0; i < topo_size; i++) {
-        if (i == root_id)
+    uint16_t n = nodecfg_get_topo_node_count();
+    uint16_t root_id = nodecfg_get_root_id();
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t node_id = nodecfg_get_topo_node_id(i);
+        if (node_id == 0xFFFF)
+            break;
+        if (node_id == root_id)
             continue;
-        nodecfg_topology_t t;
-        nodecfg_get_topology(i, &t);
-        if (t.parent_id == 0xFFFF && t.child_count == 0)
-            continue;
-        if (!mesh_is_node_online(i))
+        if (!mesh_is_node_online(node_id))
             return false;
     }
     return true;
@@ -1127,20 +1126,19 @@ static void cmd_start(int argc, char **argv)
 
     printf("Static topology detected — bypassing ASSIGN.\n");
 
-    uint16_t topo_size = nodecfg_get_topo_table_size();
-    uint16_t root_id   = nodecfg_get_root_id();
+    uint16_t topo_n = nodecfg_get_topo_node_count();
+    uint16_t root_id = nodecfg_get_root_id();
 
     uint16_t nonroot_ids[32];
     uint16_t num_nonroot = 0;
 
-    for (uint16_t i = 0; i < topo_size; i++) {
-        if (i == root_id)
+    for (uint16_t i = 0; i < topo_n; i++) {
+        uint16_t nid = nodecfg_get_topo_node_id(i);
+        if (nid == 0xFFFF)
+            break;
+        if (nid == root_id)
             continue;
-        nodecfg_topology_t t;
-        nodecfg_get_topology(i, &t);
-        if (t.parent_id == 0xFFFF && t.child_count == 0)
-            continue;
-        nonroot_ids[num_nonroot++] = i;
+        nonroot_ids[num_nonroot++] = nid;
     }
 
     if (num_nonroot == 0) {
@@ -1401,33 +1399,66 @@ static void cmd_brdsync(int argc, char **argv)
 }
 
 /* ===========================
+   TOPOLOGY COMMAND
+   =========================== */
+static void cmd_topology(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (!nodecfg_has_static_topology()) {
+        printf("No static topology (ASSIGN-based).\n");
+        return;
+    }
+    uint16_t n = nodecfg_get_topo_node_count();
+    uint16_t root_id = nodecfg_get_root_id();
+    printf("Topology (%u nodes):\n", (unsigned)n);
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t node_id = nodecfg_get_topo_node_id(i);
+        if (node_id == 0xFFFF)
+            break;
+        nodecfg_topology_t t;
+        nodecfg_get_topology(node_id, &t);
+        const char *role = (node_id == root_id) ? " (ROOT)" : (t.parent_id == root_id ? " (tier-1)" : "");
+        if (t.child_count == 0) {
+            printf("  Node %u%s (leaf)\n", node_id, role);
+        } else {
+            printf("  Node %u%s → children:", node_id, role);
+            for (uint8_t k = 0; k < t.child_count; k++)
+                printf(" %u", (unsigned)t.children[k]);
+            printf("\n");
+        }
+    }
+}
+
+/* ===========================
    STATUS COMMAND
    =========================== */
 static void cmd_status(int argc, char **argv)
 {
-    uint16_t topo_size = nodecfg_get_topo_table_size();
-    uint16_t root_id   = nodecfg_get_root_id();
-    uint64_t now_ms    = root_get_epoch_ms();
+    uint16_t n = nodecfg_get_topo_node_count();
+    uint16_t root_id = nodecfg_get_root_id();
+    uint64_t now_ms  = root_get_epoch_ms();
 
     printf("Node status:\n");
-    for (uint16_t i = 0; i < topo_size; i++) {
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t node_id = nodecfg_get_topo_node_id(i);
+        if (node_id == 0xFFFF)
+            break;
         nodecfg_topology_t t;
-        nodecfg_get_topology(i, &t);
-        if (t.parent_id == 0xFFFF && t.child_count == 0 && i != root_id)
-            continue;
-        if (i == root_id) {
-            printf("  Node %u: ROOT\n", i);
+        nodecfg_get_topology(node_id, &t);
+        if (node_id == root_id) {
+            printf("  Node %u: ROOT\n", node_id);
             continue;
         }
         bool tier1 = (t.parent_id == root_id);
         const char *tier_str = tier1 ? " (tier-1)" : "";
-        mesh_node_state_t s = mesh_get_node_state(i);
+        mesh_node_state_t s = mesh_get_node_state(node_id);
         if (s == MESH_NODE_OFFLINE) {
-            printf("  Node %u: OFFLINE%s\n", i, tier_str);
+            printf("  Node %u: OFFLINE%s\n", node_id, tier_str);
         } else {
-            int64_t last = mesh_get_node_last_seen(i);
+            int64_t last = mesh_get_node_last_seen(node_id);
             int64_t ago  = (int64_t)now_ms - last;
-            printf("  Node %u: %s%s (%.1fs ago)\n", i, mesh_node_state_str(s), tier_str, ago / 1000.0);
+            printf("  Node %u: %s%s (%.1fs ago)\n", node_id, mesh_node_state_str(s), tier_str, ago / 1000.0);
         }
     }
 }
@@ -1496,6 +1527,7 @@ static const cli_command_t command_table[] = {
     { "sync",       cmd_sync,    "sync <epoch_ms> : set root UTC clock (persistent)" },
     { "brdsync",    cmd_brdsync, "brdsync [epoch_ms] : broadcast SYNC with clock to network" },
     { "status",     cmd_status,  "show online/offline state of each topology node" },
+    { "topology",   cmd_topology,"show tree (nodes in topology only)" },
     { "help",       cmd_help,    "show available commands" },
     { "time",       cmd_time,    "show current root time" },
     { "timezone",   cmd_timezone, "set utc timezone"},
